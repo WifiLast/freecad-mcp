@@ -1,0 +1,27 @@
+diff --git a/setup.py b/setup.py
+index 98b61f9..02e7b1f 100755
+--- a/setup.py
++++ b/setup.py
+@@ -36,7 +36,7 @@ if IS_WINDOWS:
+     ]
+     nvcc_flags += [
+         "-O3",
+-        "-std=c++17",
++        "-std=c++20",
+         "--expt-relaxed-constexpr",
+         "--extended-lambda",
+         "-Xcompiler=/std:c++17",
+@@ -47,11 +47,11 @@ if IS_WINDOWS:
+ else:
+     cxx_flags += [
+         "-O3", 
+-        "-std=c++17"
++        "-std=c++20"
+     ]    
+     nvcc_flags += [
+         "-O3",
+-        "-std=c++17"
++        "-std=c++20"
+     ]
+ 
+ # -------------------------------------------------

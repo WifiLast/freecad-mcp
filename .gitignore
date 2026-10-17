@@ -1,0 +1,15 @@
+# runtime data: models, exports, logs, GPU socket, backups
+work/
+output/
+# test models (third-party meshes, not redistributable)
+model_test/
+model
+# upstream checkouts used as references / build trees (see README + patches/)
+other/
+third_party/
+__pycache__/
+*.pyc
+*.stl
+*.glb
+*.step
+*.FCStd
