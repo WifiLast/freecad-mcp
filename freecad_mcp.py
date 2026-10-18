@@ -32,28 +32,36 @@ SERVER_PATH = os.environ.get("FREECAD_MCP_PATH", "/freecad")
 TMP_DIR = os.path.join(os.environ.get("FREECAD_MCP_WORK", os.path.join(BASE_DIR, "work")), "jobs")
 os.makedirs(TMP_DIR, exist_ok=True)
 PREVIEW_MAX = 1100
-GPU_PYTHON = os.environ.get("FREECAD_GPU_PYTHON", "/mnt/data/miniconda3/envs/py310_amd/bin/python")
+import topopt  # noqa: E402  (GPU backend choice: FREECAD_GPU_BACKEND nvidia | amd, FREECAD_GPU_PYTHON overrides)
+GPU_PYTHON = topopt.gpu_python()
 GPU_SOCKET = os.environ.get("FREECAD_GPU_SOCKET", os.path.join(BASE_DIR, "work", "gpu.sock"))
 GPU_IDLE_S = os.environ.get("FREECAD_GPU_IDLE", "600")  # shared helper frees its VRAM after this
 _gpu_proc: Optional[asyncio.subprocess.Process] = None
 
 INSTRUCTIONS = """FreeCAD part design + force simulation + material reduction. Units: mm, N, MPa, g.
 Workflow: create_model (ops/script/file) -> read the face list -> analyze (fixed + loads) ->
+(inspect_model = volume, mass, bbox, centre of mass; stability = stands on its own? tip-over angle) ->
 (optimize_mesh repairs/decimates meshes on the GPU; export_web writes gltfpack-optimised .glb) ->
 optimize_topology (remove material where it carries no load) or optimize_dimensions (parametric
 model, minimal mass with stress <= yield/safety_factor) -> export_model (STEP/STL/FCStd).
 Face selectors (fixed/loads/keep): 3 | "Face3" | [3,5] | "xmin".."zmax" | {"side":"zmin"} |
-{"normal":"+z" or [0,0,1]} | {"near":[x,y,z]} | {"type":"cylinder","radius":4} | {"box":[[x0,y0,z0],[x1,y1,z1]]}
+{"normal":"+z" or [0,0,1]} | {"near":[x,y,z]} (closest face) | {"near":[x,y,z],"radius":mm} (all faces within mm) | {"type":"cylinder","radius":4} | {"box":[[x0,y0,z0],[x1,y1,z1]]}
 | {"plane":"z","value":10} | {"and":[sel,sel]} | {"on_model":"other","faces":sel}.
 Loads: {"faces":sel,"force":[fx,fy,fz]} (total N over the faces) or {"faces":sel,"pressure":MPa}.
-Fixed: sel or {"faces":sel,"dofs":"z"} (only z blocked). Materials: steel, steel_s355, stainless,
-aluminium, titanium, pla, petg, abs, nylon or {"E":MPa,"nu":..,"yield":MPa,"density":g/cm3}."""
+Fixed: sel or {"faces":sel,"dofs":"z"} (only z blocked). Materials: pla (default), petg, abs, nylon,
+steel, steel_s355, stainless, aluminium, titanium or {"base":"pla","E":MPa,"nu":..,"yield":MPa,"density":g/cm3,
+"E_z":MPa,"yield_z":MPa,"shear_z":MPa} (*_z = across the print layers; "isotropic":true drops them).
+3D printing: printed materials are transversely isotropic about build_dir (default "z" = layers stacked
+along +z, bed at zmin; "-z","x",.. or "none" = isotropic). analyze/optimize_* then also check layer
+adhesion (tension across layers vs yield_z, shear on the layer plane vs shear_z) and the governing
+safety factor is the lower of von Mises and layer adhesion. optimize_topology keeps voids
+self-supporting (<=45 deg overhang) for printed materials."""
 
 mcp = FastMCP("freecad", instructions=INSTRUCTIONS)
 
 
 async def _ensure_gpu_helper() -> None:
-    """Start the shared torch/GPU helper (warm ROCm context for all jobs) unless it is running."""
+    """Start the shared torch/GPU helper (warm CUDA/ROCm context for all jobs) unless it is running."""
     global _gpu_proc
     if os.environ.get("FREECAD_MCP_DEVICE", "auto").lower() == "cpu" or os.environ.get("FREECAD_GPU_SHARED", "1") == "0":
         return
@@ -74,12 +82,11 @@ async def _ensure_gpu_helper() -> None:
             pass
     if not os.path.exists(GPU_PYTHON):
         return
-    env = {k: v for k, v in os.environ.items() if k not in ("PYTHONPATH", "PYTHONHOME", "LD_LIBRARY_PATH")}
-    env["PYTHONNOUSERSITE"] = "1"
+    env = topopt.gpu_env()
     _gpu_proc = await asyncio.create_subprocess_exec(
         GPU_PYTHON, os.path.join(BASE_DIR, "gpu_solver.py"), "--socket", GPU_SOCKET, "--idle", GPU_IDLE_S,
         cwd=BASE_DIR, env=env, stdout=asyncio.subprocess.DEVNULL, stderr=asyncio.subprocess.DEVNULL)
-    for _ in range(100):  # torch + ROCm init takes a few seconds
+    for _ in range(100):  # torch + CUDA/ROCm init takes a few seconds
         if os.path.exists(GPU_SOCKET) or _gpu_proc.returncode is not None:
             break
         await asyncio.sleep(0.2)
@@ -189,7 +196,10 @@ async def create_model(name: str, ops: List[Dict[str, Any]] = None, script: str 
       | {"revolve":{"points":[[r,z],..],"angle":360}} | {"fillet":r,"edges":"all"|[ids]|"edges_near":[[x,y,z]]}
       | {"chamfer":r,...}. Extras per op: "rotate":[ax,ay,az,deg], "pivot":[..], "mirror":["x"], "copies":[[dx,dy,dz],..].
       Any number may be an expression string using params, e.g. {"box":["L","w","t*2"]}.
-    - script: FreeCAD Python that assigns `shape` (Part, App, V available; params as variables).
+    - script: FreeCAD Python that builds geometry and assigns `shape` (Part, App, V, math available; params as
+      variables). Only for geometry: do not encode computed numbers in boxes. Centre of mass, volume, mass and
+      bbox come from inspect_model, standing stability (support polygon, tip-over angle) from stability.
+      Script errors name the line and the code that failed.
     - file: path to STEP/IGES/BREP/FCStd or a mesh (STL/OBJ/PLY/OFF). Meshes are repaired and, above
       mesh_max_faces (default 20000), decimated on the GPU (CuMesh) before conversion to a solid.
     """
@@ -201,25 +211,43 @@ async def create_model(name: str, ops: List[Dict[str, Any]] = None, script: str 
 @mcp.tool
 async def inspect_model(name: str, material: Union[str, Dict[str, Any]] = None, select: Selector = None,
                         list_faces: bool = True, max_faces: int = 60) -> Dict[str, Any]:
-    """Volume/mass/bbox/faces of a stored model. `select` = a face selector to test which face ids it picks."""
+    """Volume/mass/bbox/centre of mass/faces of a stored model. `select` = a face selector to test which face ids
+    it picks."""
     return await _run("inspect_model", dict(name=name, material=material, select=select, list_faces=list_faces,
                                             max_faces=max_faces))
 
 
 @mcp.tool
+async def stability(name: str, up: str = "z", contact_tol_mm: float = 0.5,
+                    material: Union[str, Dict[str, Any]] = None) -> Dict[str, Any]:
+    """Does a stored model stand on its own, and how easily does it tip over? up = model axis pointing up ("z",
+    "-z", "x", ...; the floor touches the lowest points along it, within contact_tol_mm). Returns the centre of
+    mass, its height above the floor, the support polygon (convex hull of the contact points: area, ranges,
+    vertices), stable yes/no, the smallest margin from the centre of mass to the polygon edge, the tip-over angle
+    and the sideways acceleration (g) that tips it, the tipping direction, and margin / angle per axis
+    direction. For a model imported from a mesh, create_model(file=...) first."""
+    return await _run("stability", dict(name=name, up=up, contact_tol_mm=contact_tol_mm, material=material))
+
+
+@mcp.tool
 async def analyze(name: str, fixed: List[Selector], loads: List[Dict[str, Any]],
                   material: Union[str, Dict[str, Any]] = None, mesh_size: float = None, order: int = 2,
-                  safety_factor: float = None, stress_metric: str = "p99", show: bool = True,
-                  ctx: Context = None) -> ToolResult:
+                  safety_factor: float = None, stress_metric: str = "p99", build_dir: str = None,
+                  bond_profile: List[List[float]] = None, show: bool = True, ctx: Context = None) -> ToolResult:
     """Static stress simulation (FreeCAD FEM, gmsh tetra mesh, CalculiX). fixed: list of face selectors
     or {"faces":sel,"dofs":"xyz"|"z"|..}. loads: [{"faces":sel,"force":[fx,fy,fz]}] (total N) or
     [{"faces":sel,"pressure":MPa}]. Returns von Mises max/p99/p95 (MPa), max displacement (mm),
     safety factor vs yield, mass, a stress preview and an .FCStd with results (open in FreeCAD GUI).
     The max at sharp support edges is a mesh-dependent singularity; p99 is the robust value.
-    mesh_size in mm (auto ~3 elements over the thinnest dimension)."""
+    mesh_size in mm (auto ~3 elements over the thinnest dimension). Default material PLA.
+    build_dir (printed materials, default "z"): print direction -> orthotropic stiffness and a
+    layer_adhesion block (interlayer tension/shear, SF); governing_safety_factor = min of both and
+    decides `passes`. "none" = isotropic.
+    bond_profile [[height_mm, factor], ...] (height above the bed along build_dir): layer bond strength as a share
+    of the material's layer strength at each height (print_opt derives it from the cooling during the print)."""
     r = await _run("analyze", dict(name=name, fixed=fixed, loads=loads, material=material, mesh_size=mesh_size,
                                    order=order, safety_factor=safety_factor, stress_metric=stress_metric,
-                                   render=show), ctx)
+                                   build_dir=build_dir, bond_profile=bond_profile, render=show), ctx)
     return _with_previews(r, show)
 
 
@@ -232,7 +260,8 @@ async def optimize_topology(name: str, fixed: List[Selector], loads: List[Dict[s
                             keep: List[Any] = None, keep_thickness: float = None, shell: float = None, symmetry: List[str] = None,
                             filter_radius: float = None, iterations: int = None, quality: str = "draft", minify: bool = True, minify_error: float = None, out_name: str = None,
                             verify: bool = True, verify_mesh_size: float = None, smooth: int = 8,
-                            device: str = None, target_faces: int = 6000, show: bool = True,
+                            device: str = None, target_faces: int = 6000, build_dir: str = None,
+                            overhang: bool = None, show: bool = True,
                             ctx: Context = None) -> ToolResult:
     """Remove material that carries no load (SIMP topology optimisation on a voxel grid inside the
     part's own volume; the result never grows outside the original).
@@ -258,13 +287,18 @@ async def optimize_topology(name: str, fixed: List[Selector], loads: List[Dict[s
       so mounting faces/holes stay exact; STL+STEP exported. verify=True re-runs CalculiX on the
       optimised and original parts with the same supports/loads (adds 0.5-3 min).
       The iso-surface is repaired and decimated to target_faces on the GPU (CuMesh).
+    - build_dir (default "z", printed materials): orthotropic voxel stiffness; the SF search uses the
+      governing SF = min(von Mises, layer adhesion). overhang (default true for printed materials):
+      AM filter in SIMP + a final 45 deg fill, so every voxel - also the skin over internal voids -
+      prints without support material along build_dir.
     Typical run: 1-4 min."""
     r = await _run("optimize_topology", dict(
         name=name, fixed=fixed, loads=loads, load_cases=load_cases, material=material,
         volume_fraction=volume_fraction, target_safety_factor=target_safety_factor, stress_metric=stress_metric,
         resolution=resolution, keep=keep, keep_thickness=keep_thickness, shell=shell, symmetry=symmetry,
         filter_radius=filter_radius, iterations=iterations, quality=quality, minify=minify, minify_error=minify_error, out_name=out_name, verify=verify,
-        verify_mesh_size=verify_mesh_size, smooth=smooth, device=device, target_faces=target_faces), ctx)
+        verify_mesh_size=verify_mesh_size, smooth=smooth, device=device, target_faces=target_faces,
+        build_dir=build_dir, overhang=overhang), ctx)
     return _with_previews(r, show)
 
 
@@ -274,18 +308,19 @@ async def optimize_dimensions(bounds: Dict[str, Any], fixed: List[Selector], loa
                               params: Dict[str, float] = None, material: Union[str, Dict[str, Any]] = None,
                               safety_factor: float = 2.0, stress_metric: str = "p99",
                               max_displacement: float = None, n_trials: int = 20, mesh_size: float = None,
-                              start: Dict[str, float] = None, out_name: str = None,
+                              start: Dict[str, float] = None, out_name: str = None, build_dir: str = None,
                               ctx: Context = None) -> Dict[str, Any]:
     """Find the lightest dimensions of a parametric model (ops/script as in create_model, numbers as
     param expressions) such that CalculiX stress <= yield/safety_factor (and displacement <=
     max_displacement mm if set). bounds: {"t":[2,12]} | {"t":[2,12,0.5]} (step) | {"n":{"choices":[..]}}.
     params: fixed values for the other names. Optuna TPE, one FEM per trial (~3-20 s each).
     Selectors must stay valid for all parameter values (prefer side/normal/near over face ids).
-    out_name stores the best design as a model."""
+    out_name stores the best design as a model. Printed materials: the constraint is the governing SF
+    (min of von Mises and layer adhesion along build_dir, default "z")."""
     return await _run("optimize_dimensions", dict(
         bounds=bounds, fixed=fixed, loads=loads, ops=ops, script=script, params=params, material=material,
         safety_factor=safety_factor, stress_metric=stress_metric, max_displacement=max_displacement,
-        n_trials=n_trials, mesh_size=mesh_size, start=start, out_name=out_name), ctx)
+        n_trials=n_trials, mesh_size=mesh_size, start=start, out_name=out_name, build_dir=build_dir), ctx)
 
 
 @mcp.tool

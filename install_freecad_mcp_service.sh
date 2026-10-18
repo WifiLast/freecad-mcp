@@ -2,7 +2,8 @@
 
 # FreeCAD MCP Service Installation Script (mirrors rhyme_mcp/install_rhyme_mcp_service.sh)
 # Installs freecad_mcp.py (fc conda env) as systemd service freecad-mcp.
-# The server starts its GPU helper (gpu_solver.py, py310_amd torch ROCm) on demand as a child process.
+# The server starts its GPU helper (gpu_solver.py) on demand as a child process: FREECAD_GPU_BACKEND=nvidia (default,
+# py310_nv torch CUDA on the CMP card with the most free memory, FREECAD_CUDA_DEVICE pins one) or amd (py310_amd ROCm).
 #
 # Usage: sudo ./install_freecad_mcp_service.sh [--uninstall]
 # Overrides via env: FREECAD_MCP_HOST, FREECAD_MCP_PORT, FREECAD_MCP_PATH, FC_ENV_PATH, GPU_PYTHON,
@@ -23,7 +24,10 @@ SERVICE_GROUP="$(id -gn "$SERVICE_USER")"
 SERVICE_HOME="$(getent passwd "$SERVICE_USER" | cut -d: -f6)"
 FC_ENV_PATH="${FC_ENV_PATH:-$SERVICE_HOME/miniforge3/envs/fc}"
 PYTHON_PATH="$FC_ENV_PATH/bin/python"
-GPU_PYTHON="${GPU_PYTHON:-/mnt/data/miniconda3/envs/py310_amd/bin/python}"
+GPU_BACKEND="${FREECAD_GPU_BACKEND:-nvidia}"
+if [[ "$GPU_BACKEND" == "amd" ]]; then DEFAULT_GPU_PYTHON=/mnt/data/miniconda3/envs/py310_amd/bin/python
+else DEFAULT_GPU_PYTHON=/mnt/data/miniconda3/envs/py310_nv/bin/python; fi
+GPU_PYTHON="${GPU_PYTHON:-$DEFAULT_GPU_PYTHON}"
 HOST="${FREECAD_MCP_HOST:-0.0.0.0}"
 PORT="${FREECAD_MCP_PORT:-2022}"
 URL_PATH="${FREECAD_MCP_PATH:-/freecad}"
@@ -107,6 +111,7 @@ Environment="FREECAD_MCP_PORT=$PORT"
 Environment="FREECAD_MCP_PATH=$URL_PATH"
 Environment="FREECAD_MCP_DEVICE=$DEVICE"
 Environment="FREECAD_GPU_PYTHON=$GPU_PYTHON"
+Environment="FREECAD_GPU_BACKEND=$GPU_BACKEND"
 Environment="GLTFPACK=$GLTFPACK_BIN"
 Environment="KMP_AFFINITY=disabled"
 Environment="KMP_WARNINGS=0"

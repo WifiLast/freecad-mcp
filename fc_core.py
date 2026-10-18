@@ -27,34 +27,110 @@ for _d in (MODEL_DIR, RUN_DIR, EXPORT_DIR):
 V = App.Vector
 
 # --------------------------------------------------------------------------- materials
-# E [MPa], nu, yield [MPa], density [g/cm^3]
+# E [MPa], nu, yield [MPa], density [g/cm^3]. Printed (layered) materials add the values across the
+# layers (along the build direction): E_z [MPa], yield_z = interlayer tensile strength [MPa],
+# shear_z = interlayer shear strength [MPa], optional G_z (default E_z / 2(1+nu)).
 MATERIALS = {
+    "pla":        {"E": 3500,   "nu": 0.36, "yield": 50,  "density": 1.24, "label": "PLA (printed, ~100% infill)",
+                   "E_z": 2800, "yield_z": 25, "shear_z": 20},
+    "petg":       {"E": 2100,   "nu": 0.38, "yield": 45,  "density": 1.27, "label": "PETG (printed)",
+                   "E_z": 1800, "yield_z": 25, "shear_z": 20},
+    "abs":        {"E": 2200,   "nu": 0.35, "yield": 38,  "density": 1.04, "label": "ABS (printed)",
+                   "E_z": 1800, "yield_z": 18, "shear_z": 15},
+    "nylon":      {"E": 1700,   "nu": 0.40, "yield": 45,  "density": 1.01, "label": "PA12 (SLS)",
+                   "E_z": 1600, "yield_z": 38, "shear_z": 30},
     "steel":      {"E": 210000, "nu": 0.30, "yield": 235, "density": 7.85, "label": "Steel S235"},
     "steel_s355": {"E": 210000, "nu": 0.30, "yield": 355, "density": 7.85, "label": "Steel S355"},
     "stainless":  {"E": 193000, "nu": 0.29, "yield": 215, "density": 8.00, "label": "Stainless 1.4301"},
     "aluminium":  {"E": 69000,  "nu": 0.33, "yield": 240, "density": 2.70, "label": "Aluminium 6061-T6"},
     "titanium":   {"E": 114000, "nu": 0.34, "yield": 880, "density": 4.43, "label": "Ti-6Al-4V"},
-    "pla":        {"E": 3500,   "nu": 0.36, "yield": 50,  "density": 1.24, "label": "PLA (printed, ~100% infill)"},
-    "petg":       {"E": 2100,   "nu": 0.38, "yield": 45,  "density": 1.27, "label": "PETG (printed)"},
-    "abs":        {"E": 2200,   "nu": 0.35, "yield": 38,  "density": 1.04, "label": "ABS (printed)"},
-    "nylon":      {"E": 1700,   "nu": 0.40, "yield": 45,  "density": 1.01, "label": "PA12 (SLS)"},
 }
 MATERIALS["aluminum"] = MATERIALS["aluminium"]
+DEFAULT_MATERIAL = "pla"
+LAYER_KEYS = ("E_z", "G_z", "yield_z", "shear_z")
 
 
 def get_material(m):
     if m is None:
-        m = "steel"
+        m = DEFAULT_MATERIAL
     if isinstance(m, str):
         key = m.lower().strip()
         if key not in MATERIALS:
             raise ValueError(f"unknown material '{m}', known: {', '.join(sorted(MATERIALS))} or a dict {{E,nu,yield,density}}")
         return dict(MATERIALS[key], key=key)
-    base = dict(MATERIALS.get(str(m.get("base", "steel")).lower(), MATERIALS["steel"]))
-    base.update({k: m[k] for k in ("E", "nu", "yield", "density", "label") if k in m})
+    base = dict(MATERIALS.get(str(m.get("base", DEFAULT_MATERIAL)).lower(), MATERIALS[DEFAULT_MATERIAL]))
+    if "E" in m and "E_z" in base and "E_z" not in m:  # keep the base's through-layer stiffness ratio
+        base["E_z"] = base["E_z"] * float(m["E"]) / base["E"]
+    if m.get("isotropic"):
+        for k in LAYER_KEYS:
+            base.pop(k, None)
+    base.update({k: m[k] for k in ("E", "nu", "yield", "density", "label") + LAYER_KEYS if k in m})
     base.setdefault("label", "custom")
     base["key"] = "custom"
     return base
+
+
+def is_layered(mat):
+    """Printed material with properties across the layers (layer-adhesion check, orthotropic stiffness)."""
+    return "yield_z" in mat or "E_z" in mat
+
+
+def parse_build_dir(bd):
+    """'z' | '+z' | '-x' ... -> (axis 0..2, sign +-1); 'none'/False -> None (isotropic, no layer check)."""
+    if bd is None:
+        bd = "z"
+    if bd is False or str(bd).lower() in ("none", "off", "false", "iso", "isotropic", ""):
+        return None
+    s = str(bd).lower().strip()
+    sign = -1 if s.startswith("-") else 1
+    ax = s.lstrip("+-")
+    if ax not in ("x", "y", "z"):
+        raise ValueError("build_dir must be x, y, z (optionally +/-), or 'none'")
+    return "xyz".index(ax), sign
+
+
+def compliance_S(mat, axis=None):
+    """6x6 compliance in Voigt order [xx, yy, zz, xy, yz, zx] (engineering shear strains).
+    Transversely isotropic about the build axis: E/nu in the layer plane, E_z/G_z across it."""
+    import numpy as np
+    E, nu = float(mat["E"]), float(mat["nu"])
+    Eax = [E, E, E]
+    G = E / (2 * (1 + nu))
+    Gsh = [G, G, G]  # xy, yz, zx
+    if axis is not None and is_layered(mat):
+        Ez = float(mat.get("E_z", E))
+        Eax[axis] = Ez
+        Gz = float(mat.get("G_z", Ez / (2 * (1 + nu))))
+        for k, (i, j) in enumerate(((0, 1), (1, 2), (2, 0))):
+            if axis in (i, j):
+                Gsh[k] = Gz
+    S = np.zeros((6, 6))
+    for i in range(3):
+        S[i, i] = 1 / Eax[i]
+        for j in range(3):
+            if i != j:
+                S[i, j] = -nu / E  # nu_ij / E_i = nu / E for every pair (symmetric)
+    for k in range(3):
+        S[3 + k, 3 + k] = 1 / Gsh[k]
+    return S
+
+
+def ccx_engineering_constants(mat, axis):
+    """CalculiX *ELASTIC, TYPE=ENGINEERING CONSTANTS: E1,E2,E3,nu12,nu13,nu23,G12,G13,G23 (global axes)."""
+    S = compliance_S(mat, axis)
+    E = [1 / S[i, i] for i in range(3)]
+    nu12, nu13, nu23 = -S[0, 1] * E[0], -S[0, 2] * E[0], -S[1, 2] * E[1]
+    return [E[0], E[1], E[2], nu12, nu13, nu23, 1 / S[3, 3], 1 / S[5, 5], 1 / S[4, 4]]
+
+
+def material_report(mat, build=None):
+    out = {k: mat[k] for k in ("label", "E", "nu", "yield", "density") if k in mat}
+    if build is not None and is_layered(mat):
+        out.update({k: round(float(mat[k]), 2) for k in LAYER_KEYS if k in mat})
+        out["build_dir"] = ("-" if build[1] < 0 else "+") + "xyz"[build[0]]
+    elif is_layered(mat):
+        out["note"] = "build_dir none: printed material treated as isotropic, no layer-adhesion check"
+    return out
 
 
 # --------------------------------------------------------------------------- safe expressions
@@ -237,15 +313,50 @@ def clean_shape(shape):
     return shape
 
 
+SCRIPT_HELP = ("The script only builds geometry: names available are Part, App/FreeCAD, V/Vector, math and the "
+               "params; it must assign a Part solid to `shape`. Do not encode computed numbers in a shape - "
+               "inspect_model gives volume, mass, bbox and centre of mass, stability gives the support polygon "
+               "and tip-over angles, analyze the stresses.")
+
+
+class ScriptError(ValueError):
+    pass
+
+
 def run_script(code, params=None):
-    """FreeCAD python code that must assign `shape` (Part.Shape). params injected as variables."""
+    """FreeCAD python code that must assign `shape` (Part.Shape). params injected as variables. Errors name the
+    script line and its code."""
+    import traceback
     env = {"App": App, "FreeCAD": App, "Part": Part, "V": V, "Vector": V, "math": math, "params": params or {}}
     env.update(params or {})
-    exec(compile(code, "<model_script>", "exec"), env)
+    try:
+        exec(compile(code, "<model_script>", "exec"), env)
+    except SyntaxError as e:
+        raise ScriptError(f"script line {e.lineno}: syntax error: {e.msg} (`{(e.text or '').strip()[:160]}`). "
+                          + SCRIPT_HELP) from None
+    except Exception as e:
+        frames = [f for f in traceback.extract_tb(e.__traceback__) if f.filename == "<model_script>"]
+        line = frames[-1].lineno if frames else None
+        src = code.splitlines()[line - 1].strip()[:160] if line and line <= len(code.splitlines()) else ""
+        raise ScriptError(f"script line {line}: `{src}` -> {type(e).__name__}: {e}. " + SCRIPT_HELP) from None
     shape = env.get("shape")
     if shape is None or not hasattr(shape, "Volume"):
-        raise ValueError("script must assign a Part shape to the variable `shape`")
+        raise ScriptError("the script did not assign a Part shape to the variable `shape`. " + SCRIPT_HELP)
     return clean_shape(shape)
+
+
+def center_of_mass(shape):
+    """Volume centroid (mm) of a solid or compound of solids."""
+    solids = shape.Solids or [shape]
+    vol = sum(s.Volume for s in solids)
+    if vol <= 0:
+        return None
+    c = [0.0, 0.0, 0.0]
+    for s in solids:
+        cm = s.CenterOfMass
+        for i, v in enumerate((cm.x, cm.y, cm.z)):
+            c[i] += v * s.Volume / vol
+    return [round(v, 3) for v in c]
 
 
 def import_file(path):
@@ -397,6 +508,7 @@ def summary(shape, name=None, material=None, faces=True, max_faces=60):
     out["n_faces"] = len(shape.Faces)
     out["valid"] = bool(shape.isValid())
     out["solids"] = len(shape.Solids)
+    out["center_of_mass"] = center_of_mass(shape)
     if material:
         mat = get_material(material)
         out["mass_g"] = round(shape.Volume * mat["density"] / 1000.0, 2)
@@ -421,11 +533,46 @@ def _face_normal(f):
     return f.normalAt((u0 + u1) / 2, (v0 + v1) / 2)
 
 
+SELECTOR_KEYS = {"and", "faces", "on_model", "side", "plane", "value", "normal", "tol", "tol_deg", "type", "radius",
+                 "box", "near", "count"}
+SELECTOR_HELP = ('Selectors: 3 | "Face3" | [3,5] | "zmin" | {"side":"zmin"} | {"normal":"-z"} | {"near":[x,y,z]} | '
+                 '{"near":[x,y,z],"radius":mm} | {"box":[[x0,y0,z0],[x1,y1,z1]]} | {"plane":"z","value":10} | '
+                 '{"type":"cylinder","radius":4} | {"and":[sel,sel]} | {"on_model":"other","faces":sel}; '
+                 '"tol" (mm) / "tol_deg" loosen side/plane/normal.')
+
+
+def load_entry(ld, k=0):
+    """A load as (selector, load dict): {"faces":sel,"force":[..]} or the shorthand with the selector keys
+    directly in it, e.g. {"box":[[..],[..]],"force":[0,0,-50]}."""
+    if not isinstance(ld, dict):
+        raise ValueError(f'load {k + 1} must be {{"faces": <selector>, "force": [fx,fy,fz]}} or '
+                         f'{{"faces": <selector>, "pressure": MPa}}, got {ld!r}')
+    if "force" not in ld and "pressure" not in ld:
+        raise ValueError(f'load {k + 1} has neither "force" ([fx,fy,fz] in N, total over its faces) nor "pressure" '
+                         f"(MPa): {json.dumps(ld)}")
+    if "faces" in ld:
+        return ld["faces"], ld
+    sel = {key: v for key, v in ld.items() if key in SELECTOR_KEYS}
+    if not sel:
+        raise ValueError(f'load {k + 1} does not say where it acts: add "faces": <selector>, e.g. '
+                         f'{{"faces":{{"side":"zmax"}},"force":[0,0,-50]}} (got keys {sorted(ld)}). ' + SELECTOR_HELP)
+    return sel, ld
+
+
+def fixed_entry(fx):
+    """A support as (selector, dofs): a selector, {"faces":sel,"dofs":"z"} or {<selector keys>,"dofs":"z"}."""
+    if isinstance(fx, dict) and "faces" not in fx and "dofs" in fx:
+        return {key: v for key, v in fx.items() if key != "dofs"}, str(fx["dofs"]).lower()
+    if isinstance(fx, dict) and "faces" in fx:
+        return fx["faces"], str(fx.get("dofs") or "xyz").lower()
+    return fx, "xyz"
+
+
 def select_faces(shape, sel, tol=None):
     """Resolve a selector into 1-based face ids.
 
     Accepted: 3 | "Face3" | [3, 5] | {"faces":[..]} | {"side":"xmin"} | {"normal":[0,0,1] or "+z", "near":[..]?}
-    | {"near":[x,y,z]} (single closest face) | {"box":[[x0,y0,z0],[x1,y1,z1]]} (face centers inside)
+    | {"near":[x,y,z]} (single closest face) | {"near":[x,y,z],"radius":mm} (all faces within mm) | {"box":[[x0,y0,z0],[x1,y1,z1]]} (face centers inside)
     | {"type":"cylinder","radius":r?,"near":..?} | {"on_model":name,"faces":<selector>,"tol":mm}
     | {"plane":"z","value":10} (planar faces lying on z=10).  Combine with "and": [sel, sel].
     """
@@ -451,7 +598,16 @@ def select_faces(shape, sel, tol=None):
                     out.append(i)
         return out
     if not isinstance(sel, dict):
-        raise ValueError(f"bad selector {sel!r}")
+        raise ValueError(f"bad selector {sel!r}. " + SELECTOR_HELP)
+    unknown = [k for k in sel if k not in SELECTOR_KEYS]
+    if unknown:
+        hint = ""
+        if any(k.startswith("normal_") for k in unknown):
+            hint = ' A normal is one key: {"normal":"-z"} (downward) or {"normal":[0,0,-1]}.'
+        raise ValueError(f"unknown selector key(s) {unknown} in {json.dumps(sel)}.{hint} " + SELECTOR_HELP)
+    if "side" in sel and str(sel["side"]).lower().lstrip("+-") not in ("xmin", "xmax", "ymin", "ymax", "zmin", "zmax"):
+        raise ValueError(f'"side" must be xmin, xmax, ymin, ymax, zmin or zmax, got {sel["side"]!r} (zmin = the '
+                         'bottom). ' + SELECTOR_HELP)
     if "and" in sel:
         sets = [set(select_faces(shape, s, tol)) for s in sel["and"]]
         return sorted(set.intersection(*sets))
@@ -464,6 +620,7 @@ def select_faces(shape, sel, tol=None):
         return faces_on(shape, [other_faces[i - 1] for i in ref_ids], float(sel.get("tol", 0.5)))
 
     cand = list(range(1, len(faces) + 1))
+    stages = []  # (criterion, faces left) for the explanation when nothing matches
     if "side" in sel:
         ax, is_max = _axis_of(sel["side"])
         ext = [bb.XMax, bb.YMax, bb.ZMax][ax] if is_max else [bb.XMin, bb.YMin, bb.ZMin][ax]
@@ -475,6 +632,7 @@ def select_faces(shape, sel, tol=None):
             if abs(lo - ext) <= stol and abs(hi - ext) <= stol:
                 keep.append(i)
         cand = keep
+        stages.append((f"side {sel['side']} (whole face within {stol:.3g} mm of the outer plane)", len(cand)))
     if "plane" in sel:
         ax = {"x": 0, "y": 1, "z": 2}[sel["plane"].lower()]
         val = float(sel["value"])
@@ -482,6 +640,7 @@ def select_faces(shape, sel, tol=None):
         cand = [i for i in cand
                 if abs([faces[i - 1].BoundBox.XMin, faces[i - 1].BoundBox.YMin, faces[i - 1].BoundBox.ZMin][ax] - val) <= ptol
                 and abs([faces[i - 1].BoundBox.XMax, faces[i - 1].BoundBox.YMax, faces[i - 1].BoundBox.ZMax][ax] - val) <= ptol]
+        stages.append((f"plane {sel['plane']}={val:g} (+-{ptol:.3g} mm)", len(cand)))
     if "normal" in sel:
         n = _vec(sel["normal"].replace("+", "") if isinstance(sel["normal"], str) else sel["normal"]).normalize()
         cosmin = math.cos(math.radians(float(sel.get("tol_deg", 5))))
@@ -496,12 +655,14 @@ def select_faces(shape, sel, tol=None):
             except Exception:
                 pass
         cand = keep
+        stages.append((f"normal {sel['normal']} (flat faces within {sel.get('tol_deg', 5)} deg)", len(cand)))
     if "type" in sel:
         t = sel["type"].lower()
         cand = [i for i in cand if t in type(faces[i - 1].Surface).__name__.lower()]
         if "radius" in sel:
             r = float(sel["radius"])
             cand = [i for i in cand if hasattr(faces[i - 1].Surface, "Radius") and abs(faces[i - 1].Surface.Radius - r) <= max(tol, 1e-3 * r)]
+        stages.append((f"type {sel['type']}" + (f" radius {sel['radius']}" if "radius" in sel else ""), len(cand)))
     if "box" in sel:
         (x0, y0, z0), (x1, y1, z1) = sel["box"]
         keep = []
@@ -510,9 +671,22 @@ def select_faces(shape, sel, tol=None):
             if x0 - tol <= c.x <= x1 + tol and y0 - tol <= c.y <= y1 + tol and z0 - tol <= c.z <= z1 + tol:
                 keep.append(i)
         cand = keep
+        stages.append(("box (face centres inside)", len(cand)))
     if "near" in sel:
         p = _vec(sel["near"])
         vtx = Part.Vertex(p)
+        if "radius" in sel and "type" not in sel:
+            # area pick (load picker, same meaning as the vibration MCP): every face reaching into the sphere
+            r = float(sel["radius"])
+            dist = {i: faces[i - 1].distToShape(vtx)[0] for i in cand}
+            cand = [i for i in cand if dist[i] <= r + tol]
+            if not cand:
+                dmin, imin = min((d, i) for i, d in dist.items()) if dist else (float("nan"), None)
+                cp = faces[imin - 1].distToShape(vtx)[1][0][0] if imin else None
+                raise ValueError(f"selector {json.dumps(sel)} matched no faces: the nearest surface is {dmin:.1f} mm "
+                                 f"away (face {imin}, at {[round(c, 1) for c in cp] if cp else '?'}); use a radius above "
+                                 f"{dmin:.1f} or that point as near")
+            return cand
         dists = [(faces[i - 1].distToShape(vtx)[0], i) for i in cand]
         if not dists:
             return []
@@ -521,7 +695,18 @@ def select_faces(shape, sel, tol=None):
         dists.sort()
         cand = [i for d, i in dists[:n_pick] if d <= dmin + tol or n_pick > 1]
     if not cand:
-        raise ValueError(f"selector {json.dumps(sel)} matched no faces")
+        why = "; ".join(f"{c}: {n} left" for c, n in stages)
+        n_flat = sum(1 for f in faces if "Plane" in type(f.Surface).__name__)
+        tips = []
+        if "side" in sel:
+            tips.append(f'{{"side":"{sel["side"]}","tol":{max(1.0, round(0.01 * diag, 1))}}} (looser tolerance)')
+        if "normal" in sel and n_flat < len(faces) * 0.5:
+            tips.append("normal only matches flat faces; this model has few, try side/plane with tol or near+radius")
+        tips.append('{"near":[x,y,z],"radius":mm} picks every face within mm of a point (works on mesh models)')
+        tips.append('{"box":[[x0,y0,z0],[x1,y1,z1]]} picks faces whose centre lies in a box; bbox '
+                    f'{[round(v, 1) for v in (bb.XMin, bb.YMin, bb.ZMin, bb.XMax, bb.YMax, bb.ZMax)]}')
+        raise ValueError(f"selector {json.dumps(sel)} matched no faces ({len(faces)} faces, {n_flat} flat; {why}). "
+                         "Try: " + " | ".join(tips))
     return cand
 
 

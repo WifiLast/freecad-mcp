@@ -5,7 +5,8 @@ parts in FreeCAD, simulates static loads (FreeCAD FEM + gmsh + CalculiX) and red
 
 - **optimize_topology** – SIMP topology optimisation on a voxel grid inside the part. The result is a
   smoothed iso-surface trimmed with the original solid, so mounting faces and holes stay exact.
-  Exported as STL + STEP, then re-checked with CalculiX against the original.
+  Exported as STL + STEP, then re-checked with CalculiX against the original. The check is skipped
+  for hollowed mesh sources, which have no solid to mesh.
   - `shell` (mm): 3D-print mode. A solid skin of that thickness is kept on every surface and only
     the interior is optimised. For mesh sources (STL/OBJ/PLY/OFF) the exported STL is the source mesh
     plus the cavities as inner shells, cut on a fine grid (voxel = shell/2, skin measured from the
@@ -27,6 +28,33 @@ parts in FreeCAD, simulates static loads (FreeCAD FEM + gmsh + CalculiX) and red
 
 Units: mm, N, MPa, g. Tools: `list_models, create_model, inspect_model, analyze, optimize_topology,
 optimize_dimensions, optimize_mesh, export_web, export_model, render_model, delete_model`.
+
+## 3D-printed parts (layers)
+
+The default material is **PLA**. Printed presets (`pla`, `petg`, `abs`, `nylon`) carry values across
+the layers: `E_z` (stiffness along the build direction), `yield_z` (interlayer tensile strength) and
+`shear_z` (interlayer shear strength), plus an optional `G_z`. Custom materials can override these:
+`{"base":"pla","yield_z":18}`. `"isotropic":true` drops them.
+
+- `build_dir` (`analyze`, `optimize_topology`, `optimize_dimensions`; default `"z"` = layers stacked
+  along +z, bed at zmin; also `"-z"`, `"x"`, `"+y"` .. or `"none"` = isotropic). Stored with the
+  optimised model.
+- **Orthotropic stiffness**: transversely isotropic about the build axis (`fc_core.compliance_S`).
+  CalculiX gets `*ELASTIC, TYPE=ENGINEERING CONSTANTS` patched into the deck that FreeCAD writes.
+  The voxel solver builds its 24×24 KE from the same 6×6 D matrix, on both CPU and GPU.
+- **Layer-adhesion check**: σn = tension across the layers (compression is ignored), τ = shear on
+  the layer plane, utilisation = √((σn/yield_z)² + (τ/shear_z)²). It is reported as
+  `layer_adhesion` next to von Mises. `governing_safety_factor` = min(von Mises SF, layer SF) and
+  drives `passes`, the `target_safety_factor` search and the `optimize_dimensions` constraint.
+  Example: a 100×20×20 PLA cantilever printed along x has layer SF 0.74 against von Mises SF 1.48.
+- **Overhang filter** (`optimize_topology`, `overhang`, default on for printed materials):
+  - In SIMP: Langelaar's AM filter (`topopt.AMFilter`, 45°, 5 supports in the layer below, adjoint
+    sensitivities). Cost on the test beam: about 6 % stiffness at the same volume.
+  - After thresholding: `self_support_fill` adds material top-down. Each unsupported voxel takes
+    the support candidate closest to material below, so flat void ceilings, including the `shell`
+    skin, become 45° tents instead of bridges.
+  - The result reports `overhang.support_fill_voxels`.
+  - A symmetry plane along the build axis is dropped.
 
 ## Layout
 

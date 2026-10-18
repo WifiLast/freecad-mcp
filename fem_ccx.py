@@ -1,6 +1,8 @@
 """Static linear FEM with FreeCAD FEM + gmsh + CalculiX (ccx), headless."""
 import os
+import re
 import time
+import uuid
 
 import numpy as np
 
@@ -15,15 +17,40 @@ os.environ.setdefault("KMP_AFFINITY", "disabled")
 os.environ.setdefault("KMP_WARNINGS", "0")
 
 
+def _orthotropic_inp(path, mat, axis):
+    """FreeCAD writes isotropic *ELASTIC; swap in the transversely isotropic printed material."""
+    c = fc_core.ccx_engineering_constants(mat, axis)
+    with open(path) as f:
+        txt = f.read()
+    block = ("*ELASTIC, TYPE=ENGINEERING CONSTANTS\n" + ",".join(f"{v:.6g}" for v in c[:8]) + "\n"
+             + f"{c[8]:.6g},0\n")
+    txt, n = re.subn(r"^\*ELASTIC\s*\n[^\n]*\n", lambda _: block, txt, count=1, flags=re.M | re.I)
+    if n != 1:
+        raise RuntimeError(f"no *ELASTIC card to replace in {path}")
+    with open(path, "w") as f:
+        f.write(txt)
+
+
+def _pstats(v):
+    return {"max": round(float(v.max()), 3), "p99": round(float(np.percentile(v, 99)), 3)}
+
+
 def run_static(shape, material, fixed, loads, mesh_size=None, order=2, workdir=None, label="fem",
-               save_fcstd=True, keep_doc=False, matrix_solver=None):
+               save_fcstd=True, keep_doc=False, matrix_solver=None, build_dir="z", bond_profile=None):
     """fixed: list of {"faces": selector, "dofs": "xyz"} or plain selectors.
     loads: list of {"faces": selector, "force": [fx,fy,fz] N} | {"faces":..., "pressure": MPa}
     (force is total over the selected faces, any direction; pressure acts against the face normal).
+    build_dir: print direction for layered (printed) materials -> orthotropic stiffness + layer-adhesion
+    check; 'none' = isotropic.
+    bond_profile: [[height_mm, factor], ...] along build_dir (height above the bed side of the part): the layer
+    bond strength there as a share of yield_z/shear_z (e.g. from print_opt: layers that were cold when the next
+    one arrived bond weaker). Interpolated; the layer utilisation is divided by it.
     """
     t0 = time.time()
     mat = fc_core.get_material(material)
-    workdir = workdir or os.path.join(fc_core.RUN_DIR, f"{label}_{int(time.time()*1000)}")
+    build = fc_core.parse_build_dir(build_dir) if fc_core.is_layered(mat) else None
+    # unique per call: parallel analyses of the same model (print_opt orientations) start in the same millisecond
+    workdir = workdir or os.path.join(fc_core.RUN_DIR, f"{label}_{int(time.time()*1000)}_{os.getpid()}_{uuid.uuid4().hex[:6]}")
     os.makedirs(workdir, exist_ok=True)
     doc = App.newDocument("fem")
     body = doc.addObject("Part::Feature", "Body")
@@ -48,11 +75,9 @@ def run_static(shape, material, fixed, loads, mesh_size=None, order=2, workdir=N
 
     used = {"fixed": [], "loads": []}
     for k, fx in enumerate(fixed or []):
-        if not (isinstance(fx, dict) and "faces" in fx):
-            fx = {"faces": fx}
-        ids = fc_core.select_faces(shape, fx["faces"])
+        fsel, dofs = fc_core.fixed_entry(fx)
+        ids = fc_core.select_faces(shape, fsel)
         refs = [(body, f"Face{i}") for i in ids]
-        dofs = (fx.get("dofs") or "xyz").lower()
         if dofs == "xyz":
             c = ObjectsFem.makeConstraintFixed(doc, f"Fixed{k}")
             c.References = refs
@@ -71,7 +96,8 @@ def run_static(shape, material, fixed, loads, mesh_size=None, order=2, workdir=N
         raise ValueError("need at least one fixed support")
 
     for k, ld in enumerate(loads or []):
-        ids = fc_core.select_faces(shape, ld["faces"])
+        lsel, ld = fc_core.load_entry(ld, k)
+        ids = fc_core.select_faces(shape, lsel)
         refs = [(body, f"Face{i}") for i in ids]
         if "pressure" in ld:
             c = ObjectsFem.makeConstraintPressure(doc, f"Pressure{k}")
@@ -110,7 +136,11 @@ def run_static(shape, material, fixed, loads, mesh_size=None, order=2, workdir=N
     mesh.ElementOrder = "2nd" if int(order) == 2 else "1st"
     an.addObject(mesh)
     doc.recompute()
-    err = GmshTools(mesh).create_mesh()
+    gt = GmshTools(mesh)
+    # FreeCAD makes one mesh group per vertex/edge/face and renames them in O(n^2): a mesh-derived
+    # solid (20k faces) never finishes. Constraints are matched by geometry, the groups are unused.
+    gt.get_group_data = lambda: None
+    err = gt.create_mesh()
     if err:
         raise RuntimeError(f"gmsh failed: {err}")
     doc.recompute()
@@ -129,6 +159,8 @@ def run_static(shape, material, fixed, loads, mesh_size=None, order=2, workdir=N
         raise RuntimeError(f"prerequisites: {msg}")
     fea.purge_results()
     fea.write_inp_file()
+    if build is not None:
+        _orthotropic_inp(fea.inp_file_name, mat, build[0])
     fea.ccx_run()
     fea.load_results()
     res = None
@@ -154,7 +186,7 @@ def run_static(shape, material, fixed, loads, mesh_size=None, order=2, workdir=N
                           "max_at": fc_core.r3(p_max, 2)},
         "displacement_mm": {"max": round(float(disp.max()), 5), "max_at": fc_core.r3(p_dmax, 2),
                             "max_vector": dvec[idmax].round(5).tolist()},
-        "material": {k: mat[k] for k in ("label", "E", "nu", "yield", "density")},
+        "material": fc_core.material_report(mat, build),
         "volume_mm3": round(shape.Volume, 2),
         "mass_g": round(shape.Volume * mat["density"] / 1000.0, 2),
         "bcs": used,
@@ -163,6 +195,40 @@ def run_static(shape, material, fixed, loads, mesh_size=None, order=2, workdir=N
     }
     y = mat["yield"]
     out["safety_factor"] = {"vs_max": round(y / max(vm.max(), 1e-12), 3), "vs_p99": round(y / max(np.percentile(vm, 99), 1e-12), 3)}
+    util = vm / y
+    if build is not None and "yield_z" in mat:
+        import topopt
+        s = np.stack([np.array(getattr(res, f"NodeStress{c}"), float) for c in ("XX", "YY", "ZZ", "XY", "YZ", "XZ")], 1)
+        sn, tau, lu = topopt.layer_stress(s, build[0], float(mat["yield_z"]), float(mat.get("shear_z", mat["yield_z"])))
+        if bond_profile:
+            bp = np.asarray(sorted(bond_profile), float)
+            ax, sg = build
+            xyz = np.array([[(v := fm.getNodeById(n)).x, v.y, v.z] for n in node_ids], float)
+            hz = sg * xyz[:, ax]
+            hz -= hz.min()
+            fac = np.clip(np.interp(hz, bp[:, 0], bp[:, 1]), 0.05, 1.0)
+            lu = lu / fac
+        il = int(np.argmax(lu))
+        out["layer_adhesion"] = {
+            "build_dir": out["material"]["build_dir"],
+            "sigma_n_MPa": _pstats(sn), "tau_MPa": _pstats(tau),
+            "utilization": _pstats(lu), "max_at": fc_core.r3(fm.getNodeById(node_ids[il]), 2),
+            "safety_factor": {"vs_max": round(1 / max(lu.max(), 1e-12), 3),
+                              "vs_p99": round(1 / max(np.percentile(lu, 99), 1e-12), 3)},
+            "criterion": "sqrt((sigma_n/yield_z)^2 + (tau/shear_z)^2), sigma_n = tension across the layers, "
+                         "tau = shear on the layer plane",
+        }
+        if bond_profile:
+            out["layer_adhesion"]["bond_profile"] = {"points": len(bond_profile), "min_factor": round(float(bp[:, 1].min()), 3),
+                                                     "note": "layer strength scaled by the bond factor at each height"}
+        util = np.maximum(util, lu)
+        out["_node_layer"] = lu
+    gov = {"vs_max": round(1 / max(util.max(), 1e-12), 3), "vs_p99": round(1 / max(np.percentile(util, 99), 1e-12), 3),
+           "vs_p95": round(1 / max(np.percentile(util, 95), 1e-12), 3), "vs_mean": round(1 / max(util.mean(), 1e-12), 3)}
+    if "layer_adhesion" in out:
+        lsf = out["layer_adhesion"]["safety_factor"]
+        gov["governed_by"] = "layer_adhesion" if lsf["vs_p99"] < out["safety_factor"]["vs_p99"] else "von_mises"
+    out["governing_safety_factor"] = gov
     if save_fcstd:
         path = os.path.join(workdir, f"{label}.FCStd")
         doc.saveAs(path)

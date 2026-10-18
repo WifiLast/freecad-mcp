@@ -5,6 +5,7 @@ Only "active" elements (inside the original part) take part; everything else is 
 Units: mm, N, MPa.
 """
 import os
+import subprocess
 import time
 
 import numpy as np
@@ -49,9 +50,10 @@ def _B(xi, eta, zeta, h=1.0):
     return B
 
 
-def hex_KE(nu, h=1.0):
-    """Stiffness of a cube of side h with E=1 (2x2x2 Gauss)."""
-    D = elasticity_D(1.0, nu)
+def hex_KE(D, h=1.0):
+    """Stiffness of a cube of side h for the 6x6 material matrix D (a float = isotropic nu, E=1); 2x2x2 Gauss."""
+    if np.ndim(D) == 0:
+        D = elasticity_D(1.0, float(D))
     g = 1 / np.sqrt(3)
     KE = np.zeros((24, 24))
     detJ = (h / 2) ** 3
@@ -66,6 +68,20 @@ def hex_KE(nu, h=1.0):
 def von_mises(s):
     sx, sy, sz, txy, tyz, tzx = s.T
     return np.sqrt(0.5 * ((sx - sy) ** 2 + (sy - sz) ** 2 + (sz - sx) ** 2) + 3 * (txy ** 2 + tyz ** 2 + tzx ** 2))
+
+
+# Voigt shear components lying on the layer plane of build axis a: xy=3, yz=4, zx=5
+_LAYER_SHEAR = {0: (3, 5), 1: (3, 4), 2: (4, 5)}
+
+
+def layer_stress(s, axis, yield_z, shear_z):
+    """Interlayer stresses of (n,6) Voigt stresses: sigma_n = tension across the layers (compression
+    does not open them), tau = shear on the layer plane; utilisation = quadratic interaction
+    (sigma_n/yield_z)^2 + (tau/shear_z)^2, reported as its root (1 = layer bond fails)."""
+    sn = np.maximum(s[:, axis], 0.0)
+    i, j = _LAYER_SHEAR[axis]
+    tau = np.hypot(s[:, i], s[:, j])
+    return sn, tau, np.sqrt((sn / yield_z) ** 2 + (tau / shear_z) ** 2)
 
 
 class Grid:
@@ -101,8 +117,9 @@ class Grid:
 class VoxelFEM:
     """Linear elastic FE system over a set of active voxels with node BCs."""
 
-    def __init__(self, grid, elems, nu, fixed, loadcases, backend=None):
-        """elems: (m,3) element indices. fixed: list of (global_node_ids, 'xyz').
+    def __init__(self, grid, elems, D, fixed, loadcases, backend=None):
+        """elems: (m,3) element indices. D: unit material matrix (or isotropic nu); element stiffness
+        scales with Ee. fixed: list of (global_node_ids, 'xyz').
         loadcases: list of dict global_node_id -> force vec (3,)."""
         self.g = grid
         self.elems = np.asarray(elems)
@@ -114,7 +131,7 @@ class VoxelFEM:
         self.nnode = len(uniq)
         self.ndof = 3 * self.nnode
         self.edof = (3 * self.enodes[:, :, None] + np.arange(3)[None, None, :]).reshape(self.m, 24)
-        self.KE = hex_KE(nu, grid.h)
+        self.KE = hex_KE(D, grid.h)
         self.iK = np.repeat(self.edof, 24, axis=1).ravel()
         self.jK = np.tile(self.edof, (1, 24)).ravel()
         g2l = {int(gn): i for i, gn in enumerate(uniq)}
@@ -217,15 +234,20 @@ class VoxelFEM:
             return self._comp
         return float(np.sum(self.F * self.U))
 
-    def stresses(self, E_real, nu):
-        """Element-center von Mises (max over load cases) for full material E_real."""
+    def stresses(self, D_real, layer=None):
+        """Element-center von Mises (max over load cases) for the full material matrix D_real.
+        layer=(axis, yield_z, shear_z) also returns the interlayer sigma_n, tau and utilisation."""
         B0 = _B(0, 0, 0, self.g.h)
-        S = elasticity_D(E_real, nu) @ B0  # 6x24
+        S = D_real @ B0  # 6x24
         vm = np.zeros(self.m)
+        lay = {"sigma_n": np.zeros(self.m), "tau": np.zeros(self.m), "util": np.zeros(self.m)} if layer else None
         for c in range(self.F.shape[1]):
-            ue = self.U[self.edof, c]
-            vm = np.maximum(vm, von_mises(ue @ S.T))
-        return vm
+            s = self.U[self.edof, c] @ S.T
+            vm = np.maximum(vm, von_mises(s))
+            if layer:
+                for k, v in zip(("sigma_n", "tau", "util"), layer_stress(s, *layer)):
+                    lay[k] = np.maximum(lay[k], v)
+        return vm, lay
 
     def max_disp(self):
         d = np.linalg.norm(self.U.reshape(self.nnode, 3, -1), axis=1)  # (nnode, nlc)
@@ -268,9 +290,139 @@ def _symmetrize(v, maps):
     return v
 
 
+class AMFilter:
+    """Langelaar's additive-manufacturing filter (3D, 45 deg): printed density of a voxel is
+    smin(own density, smax(printed density of its 5 supports in the layer below: directly below +
+    the 4 face neighbours of that one)). Applied bottom-up after the density filter, so voxels can
+    only be solid where the layer below carries them - overhangs above 45 deg vanish from the design.
+    Supports: the build plate (first layer) and part-boundary voxels (directly below outside the part =
+    the original geometry's own down-facing surface) count as solid; passive voxels stay 1."""
+    P, XI0, EPS = 40.0, 0.5, 1e-4
+
+    def __init__(self, grid, elems, passive, axis=2, sign=1):
+        e = np.asarray(elems)
+        n = grid.n
+        lookup = np.full(n, -1, np.int64)
+        lookup[e[:, 0], e[:, 1], e[:, 2]] = np.arange(len(e))
+        layer = e[:, axis] if sign > 0 else n[axis] - 1 - e[:, axis]
+        self.layer = layer
+        self.lookup, self.n, self.axis, self.sign = lookup, n, axis, sign
+        sup = np.full((len(e), 5), -1, np.int64)  # >=0 element, -1 none, -2 solid (bed / part boundary)
+        o1, o2 = [a for a in range(3) if a != axis]
+        offs = [(0, 0), (1, 0), (-1, 0), (0, 1), (0, -1)]
+        for k, (d1, d2) in enumerate(offs):
+            q = e.copy()
+            q[:, axis] -= sign
+            q[:, o1] += d1
+            q[:, o2] += d2
+            inside = np.all((q >= 0) & (q < np.array(n)), axis=1)
+            idx = np.full(len(e), -1, np.int64)
+            idx[inside] = lookup[q[inside, 0], q[inside, 1], q[inside, 2]]
+            if k == 0:  # directly below: bed or outside the part -> carried
+                idx[idx < 0] = -2
+            sup[:, k] = idx
+        sup[layer == 0, 0] = -2
+        self.sup = sup
+        self.Q = self.P + np.log(np.maximum((sup != -1).sum(1), 1)) / np.log(self.XI0)
+        self.passive = np.asarray(passive, bool)
+        order = np.argsort(layer, kind="stable")
+        des = order[~self.passive[order]]
+        bounds = np.searchsorted(layer[des], np.arange(layer.max() + 2))
+        self.layers = [des[bounds[i]:bounds[i + 1]] for i in range(len(bounds) - 1) if bounds[i + 1] > bounds[i]]
+
+    def _vals(self, xi, ids):
+        sp_ = self.sup[ids]
+        return np.where(sp_ >= 0, xi[np.maximum(sp_, 0)], np.where(sp_ == -2, 1.0, 0.0))
+
+    def forward(self, xt):
+        xi = np.array(xt, float)
+        xi[self.passive] = 1.0
+        self._cache = []
+        for ids in self.layers:
+            v = self._vals(xi, ids)
+            S = np.maximum((v ** self.P).sum(1), 1e-300)
+            Xi = S ** (1.0 / self.Q[ids])
+            d = xt[ids] - Xi
+            r = np.sqrt(d * d + self.EPS)
+            xi[ids] = 0.5 * (xt[ids] + Xi - r + np.sqrt(self.EPS))
+            self._cache.append((v, S, d / r))
+        return xi
+
+    def backward(self, g):
+        """d f / d xt from d f / d xi (call after forward with the same xt). g: (m,) or (m,c)."""
+        g = np.asarray(g, float)
+        one = g.ndim == 1
+        lam = (g[:, None] if one else g).copy()
+        out = lam.copy()
+        for ids, (v, S, dr) in zip(reversed(self.layers), reversed(self._cache)):
+            l_ = lam[ids]
+            out[ids] = l_ * (0.5 * (1 - dr))[:, None]
+            dXi = l_ * (0.5 * (1 + dr))[:, None]
+            Q = self.Q[ids]
+            dv = (self.P / Q)[:, None] * v ** (self.P - 1) * (S ** (1.0 / Q - 1))[:, None]  # (k,5)
+            sp_ = self.sup[ids]
+            ok = sp_ >= 0
+            np.add.at(lam, sp_[ok], (dXi[:, None, :] * dv[:, :, None])[ok])
+        return out[:, 0] if one else out
+
+
+def unsupported(elems, solid, am):
+    """Solid voxels whose 5 supports in the layer below are all empty (and not bed/part boundary)."""
+    v = np.where(am.sup >= 0, solid[np.maximum(am.sup, 0)], am.sup == -2)
+    return solid & ~v.any(1)
+
+
+def self_support_fill(elems, solid, am):
+    """Make every solid voxel printable without support material by adding material only. Top-down,
+    a voxel with nothing under it gets the one of its 5 supports closest to existing material in the
+    layer below, so under a flat ceiling a 45 deg roof grows inward from the walls (tent / teardrop
+    void) instead of a horizontal bridge. Returns (solid, n_added)."""
+    e = np.asarray(elems)
+    A = np.zeros(am.n, bool)
+    A[e[solid, 0], e[solid, 1], e[solid, 2]] = True
+    act = am.lookup >= 0
+    A, act = np.moveaxis(A, am.axis, 0), np.moveaxis(act, am.axis, 0)
+    if am.sign < 0:
+        A, act = A[::-1], act[::-1]
+    A = A.copy()
+    n0 = int(A.sum())
+    offs = [(0, 0), (1, 0), (-1, 0), (0, 1), (0, -1)]
+    for L in range(A.shape[0] - 1, 0, -1):
+        cur, below, actb = A[L], A[L - 1], act[L - 1]
+        sup = below | ~actb  # directly below: solid, or outside the part (its own down-facing surface)
+        for d1, d2 in offs[1:]:
+            sup = sup | _shift2(below, d1, d2)
+        need = np.argwhere(cur & ~sup)
+        if not len(need):
+            continue
+        dist = ndimage.distance_transform_edt(~below) if below.any() else np.zeros(below.shape)
+        cand = need[:, None, :] + np.array(offs)[None]  # (k,5,2), directly below first
+        ok = np.all((cand >= 0) & (cand < np.array(below.shape)), axis=2)
+        c0, c1 = np.clip(cand[..., 0], 0, below.shape[0] - 1), np.clip(cand[..., 1], 0, below.shape[1] - 1)
+        ok &= actb[c0, c1]
+        score = np.where(ok, dist[c0, c1], np.inf)
+        k = np.argmin(score, axis=1)  # ties -> directly below
+        r = np.arange(len(need))
+        below[c0[r, k], c1[r, k]] = True
+    if am.sign < 0:
+        A = A[::-1]
+    A = np.moveaxis(A, 0, am.axis)
+    out = A[e[:, 0], e[:, 1], e[:, 2]]
+    return out, int(out.sum()) - int(np.asarray(solid).sum())
+
+
+def _shift2(a, d1, d2):
+    """b[i, j] = a[i + d1, j + d2] (False outside)."""
+    b = np.zeros_like(a)
+    n1, n2 = a.shape
+    b[max(0, -d1):n1 - max(0, d1), max(0, -d2):n2 - max(0, d2)] = a[max(0, d1):n1 - max(0, -d1), max(0, d2):n2 - max(0, -d2)]
+    return b
+
+
 def simp(fem, passive, volfrac, penal=3.0, rmin=1.5, max_iter=60, tol=0.01, x0=None, sym_maps=None,
-         emin=1e-6, move=0.2, log=None, solve_tol=1e-4):
-    """Minimise compliance s.t. total solid fraction == volfrac (passive elements count as solid)."""
+         emin=1e-6, move=0.2, log=None, solve_tol=1e-4, am=None):
+    """Minimise compliance s.t. total solid fraction == volfrac (passive elements count as solid).
+    am: AMFilter -> overhang-free (self-supporting) design."""
     m = fem.m
     passive = np.asarray(passive, bool)
     design = ~passive
@@ -285,16 +437,24 @@ def simp(fem, passive, volfrac, penal=3.0, rmin=1.5, max_iter=60, tol=0.01, x0=N
     hist = []
     t0 = time.time()
     xPhys = x
+
+    def phys(xd):
+        xt = (H @ xd) / Hs
+        xt[passive] = 1.0
+        return am.forward(xt) if am is not None else xt
+
     for it in range(1, max_iter + 1):
         p = min(penal, 1.5 + (penal - 1.5) * it / 15.0) if x0 is None else penal
-        xPhys = (H @ x) / Hs
-        xPhys[passive] = 1.0
+        xPhys = phys(x)
         Ee = emin + xPhys ** p * (1 - emin)
         fem.solve(Ee, tol=solve_tol)  # OC needs sensitivities, not 1e-7 accurate displacements
         ce = fem.elem_energy()
         c = float(np.sum(Ee * ce))
         dc = -p * xPhys ** (p - 1) * (1 - emin) * ce
         dv = np.ones(m)
+        if am is not None:
+            dc, dv = am.backward(np.stack([dc, dv], 1)).T
+            dv = np.maximum(dv, 1e-9)
         dc = H @ (dc / Hs)
         dv = H @ (dv / Hs)
         if sym_maps:
@@ -306,8 +466,7 @@ def simp(fem, passive, volfrac, penal=3.0, rmin=1.5, max_iter=60, tol=0.01, x0=N
             lmid = 0.5 * (l1 + l2)
             xn = np.clip(x * np.sqrt(-dcn / dv / lmid), np.maximum(0.0, x - move), np.minimum(1.0, x + move))
             xn[passive] = 1.0
-            xp = (H @ xn) / Hs
-            xp[passive] = 1.0
+            xp = phys(xn)
             if xp.sum() > volfrac * m:
                 l1 = lmid
             else:
@@ -322,8 +481,7 @@ def simp(fem, passive, volfrac, penal=3.0, rmin=1.5, max_iter=60, tol=0.01, x0=N
             log(f"it {it} c={c:.5g} vol={xPhys.mean():.3f} change={change:.3f}")
         if it >= 10 and change < tol:
             break
-    xPhys = (H @ x) / Hs
-    xPhys[passive] = 1.0
+    xPhys = phys(x)
     return {"x": x, "xPhys": xPhys, "iterations": it, "compliance_history": hist, "time_s": round(time.time() - t0, 2)}
 
 
@@ -354,14 +512,15 @@ def keep_connected(grid, elems, solid, anchor):
     return solid & ok
 
 
-def evaluate(grid, elems, solid, nu, E, fixed, loadcases, backend=None):
-    """Voxel FEM of a binary design: compliance, max displacement, element von Mises."""
+def evaluate(grid, elems, solid, D, E, fixed, loadcases, backend=None, layer=None):
+    """Voxel FEM of a binary design: compliance, max displacement, element von Mises (+ interlayer
+    stresses with layer=(axis, yield_z, shear_z)). D: unit material matrix (in-layer E = 1)."""
     sub = elems[solid]
-    fem = VoxelFEM(grid, sub, nu, fixed, loadcases, backend=backend)
+    fem = VoxelFEM(grid, sub, D, fixed, loadcases, backend=backend)
     fem.solve(np.ones(len(sub)) * E)
-    vm = fem.stresses(E, nu)
+    vm, lay = fem.stresses(E * np.asarray(D) if np.ndim(D) else elasticity_D(E, D), layer)
     dmax, dat = fem.max_disp()
-    out = {"vm": vm, "disp_max": dmax, "disp_at": dat, "compliance": fem.compliance(),
+    out = {"vm": vm, "layer": lay, "disp_max": dmax, "disp_at": dat, "compliance": fem.compliance(),
            "lost_force": fem.lost_force, "solver": dict(fem.solver_stats)}
     fem.close()
     return out
@@ -391,7 +550,7 @@ class GPUBackend:
                 self.sock = None
         if self.sock is None:
             here = os.path.dirname(os.path.abspath(__file__))
-            python = python or os.environ.get("FREECAD_GPU_PYTHON", "/mnt/data/miniconda3/envs/py310_amd/bin/python")
+            python = python or gpu_python()
             if not os.path.exists(python):
                 raise RuntimeError(f"GPU python not found: {python}")
             self.p = subprocess.Popen([python, os.path.join(here, "gpu_solver.py")], stdin=subprocess.PIPE,
@@ -460,9 +619,47 @@ class GPUBackend:
                 self.p.kill()
 
 
+GPU_PYTHONS = {"amd": "/mnt/data/miniconda3/envs/py310_amd/bin/python",      # torch ROCm (RX 7900 XTX)
+               "nvidia": "/mnt/data/miniconda3/envs/py310_nv/bin/python"}   # torch CUDA (CMP 50HX)
+
+
+def gpu_backend():
+    """FREECAD_GPU_BACKEND: nvidia (default) | amd; an explicit FREECAD_GPU_PYTHON of the AMD env means amd."""
+    py = os.environ.get("FREECAD_GPU_PYTHON", "")
+    if py and (py == GPU_PYTHONS["amd"] or "amd" in py or "rocm" in py):
+        return "amd"
+    b = os.environ.get("FREECAD_GPU_BACKEND", "nvidia").lower()
+    return "amd" if b in ("amd", "rocm", "hip") else "nvidia"
+
+
+def gpu_python():
+    return os.environ.get("FREECAD_GPU_PYTHON") or GPU_PYTHONS[gpu_backend()]
+
+
+def _freest_cuda_device():
+    """Index (PCI order, as nvidia-smi) of the NVIDIA GPU with the most free memory, or None."""
+    try:
+        out = subprocess.run(["nvidia-smi", "--query-gpu=index,memory.free", "--format=csv,noheader,nounits"],
+                             capture_output=True, text=True, timeout=10).stdout
+        rows = [tuple(int(v) for v in ln.split(",")) for ln in out.strip().splitlines() if ln.strip()]
+        return max(rows, key=lambda r: r[1])[0] if rows else None
+    except Exception:
+        return None
+
+
 def gpu_env():
-    """Environment for the torch helper: FreeCAD env paths must not leak into the torch env."""
+    """Environment for the torch helper: FreeCAD env paths must not leak into the torch env; on the NVIDIA
+    backend the helper sees one card (FREECAD_CUDA_DEVICE, else the one with the most free memory)."""
     env = dict(os.environ, PYTHONNOUSERSITE="1")
     for k in ("PYTHONPATH", "PYTHONHOME", "LD_LIBRARY_PATH"):
         env.pop(k, None)
+    if gpu_backend() == "nvidia":  # the AMD toolchain environment (shell) must not steer the CUDA torch
+        for k in ("TRITON_DEFAULT_BACKEND", "HIP_PLATFORM", "HSA_XNACK", "PYTORCH_ROCM_ARCH", "CC", "CXX"):
+            env.pop(k, None)
+    if gpu_backend() == "nvidia" and "CUDA_VISIBLE_DEVICES" not in os.environ:
+        dev = os.environ.get("FREECAD_CUDA_DEVICE")
+        dev = dev if dev is not None else _freest_cuda_device()
+        if dev is not None:
+            env["CUDA_DEVICE_ORDER"] = "PCI_BUS_ID"
+            env["CUDA_VISIBLE_DEVICES"] = str(dev)
     return env

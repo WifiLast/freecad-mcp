@@ -1,4 +1,5 @@
-"""GPU mesh optimisation with CuMesh (ROCm build in third_party/CuMesh), used inside gpu_solver.py.
+"""GPU mesh optimisation with CuMesh (ROCm build in third_party/CuMesh, CUDA build in third_party/CuMesh_cuda),
+used inside gpu_solver.py.
 
 optimize(): repair (degenerate/duplicate faces, non-manifold edges, small islands, holes, winding)
 and QEM-decimate a triangle mesh on the GPU. Returns numpy arrays plus a short report.
@@ -10,8 +11,8 @@ import time
 import numpy as np
 import torch
 
-CUMESH_DIR = os.environ.get("FREECAD_CUMESH_DIR", os.path.join(os.path.dirname(os.path.abspath(__file__)),
-                                                               "third_party", "CuMesh"))
+CUMESH_DIR = os.environ.get("FREECAD_CUMESH_DIR", os.path.join(
+    os.path.dirname(os.path.abspath(__file__)), "third_party", "CuMesh" if torch.version.hip else "CuMesh_cuda"))
 _cm = None
 
 

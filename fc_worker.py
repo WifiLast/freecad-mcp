@@ -14,6 +14,7 @@ import fc_core  # noqa: E402
 from fc_core import App, Part, V  # noqa: E402
 
 import json  # noqa: E402
+import math  # noqa: E402
 import time  # noqa: E402
 import traceback  # noqa: E402
 
@@ -59,8 +60,106 @@ def act_inspect_model(a):
     for k in ("source", "params", "derived_from", "optimization"):
         if k in meta:
             out[k] = meta[k]
-    if a.get("select") is not None:
-        out["selected_faces"] = fc_core.select_faces(shape, a["select"])
+    if a.get("select") is not None:  # testing a selector: a miss is an answer with the reason, not an error
+        try:
+            out["selected_faces"] = fc_core.select_faces(shape, a["select"])
+        except ValueError as e:
+            out["selected_faces"] = []
+            out["select_problem"] = str(e)
+    return out
+
+
+def _up_vector(up):
+    up = str(up or "z").lower().strip()
+    sign = -1.0 if up.startswith("-") else 1.0
+    ax = up.lstrip("+-")
+    if ax not in ("x", "y", "z"):
+        raise ValueError(f"up must be x, y, z, -x, -y or -z, got {up!r}")
+    u = np.zeros(3)
+    u["xyz".index(ax)] = sign
+    return u, ax
+
+
+def act_stability(a):
+    """Standing stability on a flat floor: support polygon from the lowest points along `up`, centre of mass,
+    tip-over angle and lateral acceleration per direction."""
+    from scipy.spatial import ConvexHull
+    shape, meta = fc_core.load_model(a["name"])
+    u, ax = _up_vector(a.get("up", "z"))
+    com = np.asarray(fc_core.center_of_mass(shape), float)
+    ext = max(shape.BoundBox.XLength, shape.BoundBox.YLength, shape.BoundBox.ZLength)
+    verts, _ = shape.tessellate(max(0.05, ext / 500.0))
+    P = np.array([[v.x, v.y, v.z] for v in verts], float)
+    h = P @ u
+    base = float(h.min())
+    tol = float(a.get("contact_tol_mm", 0.5))
+    contact = P[h <= base + tol]
+    # in-plane axes: the two remaining model axes, in x, y, z order
+    others = [i for i in range(3) if i != "xyz".index(ax)]
+    e1, e2 = np.eye(3)[others[0]], np.eye(3)[others[1]]
+    c2 = np.column_stack([contact @ e1, contact @ e2])
+    g2 = np.array([com @ e1, com @ e2])
+    com_h = float(com @ u - base)
+    names = ("xyz"[others[0]], "xyz"[others[1]])
+    out = {"name": a["name"], "up": a.get("up", "z"), "center_of_mass": com.round(3).tolist(),
+           "com_height_mm": round(com_h, 2), "contact_tol_mm": tol, "contact_points": int(len(contact))}
+    if a.get("material") or meta.get("material"):
+        mat = fc_core.get_material(a.get("material") or meta.get("material"))
+        out["mass_g"] = round(shape.Volume * mat["density"] / 1000.0, 2)
+    if len(np.unique(c2.round(3), axis=0)) < 3:
+        out.update(stable=False, verdict="the part touches the floor in a point or a line only: it cannot stand "
+                                         "on its own in this orientation")
+        return out
+    hull = ConvexHull(c2)
+    poly = c2[hull.vertices]
+    out["support_polygon"] = {"area_mm2": round(float(hull.volume), 1),
+                              f"{names[0]}_range": [round(float(poly[:, 0].min()), 2), round(float(poly[:, 0].max()), 2)],
+                              f"{names[1]}_range": [round(float(poly[:, 1].min()), 2), round(float(poly[:, 1].max()), 2)],
+                              "vertices": poly.round(2).tolist()[:40]}
+    # signed distance from the COM projection to each hull edge (positive = inside)
+    edges = []
+    for k in range(len(poly)):
+        p, q = poly[k], poly[(k + 1) % len(poly)]
+        t = q - p
+        n_out = np.array([t[1], -t[0]]) / max(np.linalg.norm(t), 1e-12)
+        if n_out @ (poly.mean(0) - p) > 0:
+            n_out = -n_out
+        d = float(n_out @ (p - g2))
+        edges.append((d, n_out))
+    dmin, nmin = min(edges, key=lambda e: e[0])
+    inside = dmin > 0
+
+    def ray(dirn):
+        best = None
+        for k in range(len(poly)):
+            p, q = poly[k], poly[(k + 1) % len(poly)]
+            mtx = np.column_stack([dirn, p - q])
+            if abs(np.linalg.det(mtx)) < 1e-12:
+                continue
+            s_, w = np.linalg.solve(mtx, p - g2)
+            if s_ >= 0 and -1e-9 <= w <= 1 + 1e-9:
+                best = s_ if best is None else min(best, s_)
+        return best
+    per_dir = {}
+    for lbl, dv in ((f"+{names[0]}", (1, 0)), (f"-{names[0]}", (-1, 0)), (f"+{names[1]}", (0, 1)), (f"-{names[1]}", (0, -1))):
+        m = ray(np.array(dv, float)) if inside else None
+        per_dir[lbl] = ({"margin_mm": round(m, 2), "tip_angle_deg": round(math.degrees(math.atan2(m, com_h)), 1),
+                         "tip_lateral_accel_g": round(m / com_h, 3) if com_h > 0 else None} if m is not None else None)
+    tip3 = nmin[0] * e1 + nmin[1] * e2
+    out.update({
+        "stable": bool(inside),
+        "min_margin_mm": round(dmin, 2),
+        "min_tip_angle_deg": round(math.degrees(math.atan2(dmin, com_h)), 1) if inside else 0.0,
+        "tip_lateral_accel_g": round(dmin / com_h, 3) if inside and com_h > 0 else 0.0,
+        "tips_towards": [round(float(v), 3) for v in tip3],
+        "per_direction": per_dir})
+    if not inside:
+        out["verdict"] = (f"falls over: the centre of mass lies {-dmin:.1f} mm outside the support polygon "
+                          f"(towards {out['tips_towards']})")
+    else:
+        ang = out["min_tip_angle_deg"]
+        out["verdict"] = (f"stands; it tips when tilted {ang} deg towards {out['tips_towards']} or pushed sideways with "
+                          f"{out['tip_lateral_accel_g']} g" + (" - marginal, a small bump knocks it over" if ang < 10 else ""))
     return out
 
 
@@ -114,17 +213,22 @@ def _strip(res):
 def act_analyze(a):
     import fem_ccx
     shape, meta = fc_core.load_model(a["name"])
-    mat = a.get("material") or meta.get("material") or "steel"
+    mat = a.get("material") or meta.get("material")
     res = fem_ccx.run_static(shape, mat, a.get("fixed"), a.get("loads"), mesh_size=a.get("mesh_size"),
-                             order=a.get("order", 2), label=a["name"])
+                             order=a.get("order", 2), label=a["name"], build_dir=_build_dir(a, meta),
+                             bond_profile=a.get("bond_profile"))
     out = _strip(res)
     sf = a.get("safety_factor")
     if sf:
         out["required_safety_factor"] = sf
-        out["passes"] = out["safety_factor"]["vs_" + a.get("stress_metric", "p99")] >= float(sf)
+        out["passes"] = out["governing_safety_factor"]["vs_" + a.get("stress_metric", "p99")] >= float(sf)
     if a.get("render", True):
         out["preview"] = render_ccx(shape, res, os.path.join(res["workdir"], "stress.png"))
     return out
+
+
+def _build_dir(a, meta=None):
+    return a.get("build_dir") or (meta or {}).get("build_dir") or "z"
 
 
 def _ccx_node_xyz_vm(res):
@@ -169,32 +273,38 @@ def tessellate(shape, max_len=None):
     return T.reshape(-1, 3), np.arange(len(T) * 3).reshape(-1, 3)
 
 
-def render_mesh(verts, tris, path, pts=None, vals=None, title="", views=((25, -60), (25, 120), (90, -90))):
+def render_mesh(verts, tris, path, pts=None, vals=None, title="", views=((25, -60), (25, 120), (90, -90)),
+                view_tris=None):
+    """view_tris: one triangle set per view (e.g. full exterior + sections); default `tris` for all."""
     import matplotlib
     matplotlib.use("Agg")
     import matplotlib.pyplot as plt
     from mpl_toolkits.mplot3d.art3d import Poly3DCollection
     from scipy.spatial import cKDTree
-    tri_xyz = verts[tris]
-    n = np.cross(tri_xyz[:, 1] - tri_xyz[:, 0], tri_xyz[:, 2] - tri_xyz[:, 0])
-    n /= np.linalg.norm(n, axis=1, keepdims=True) + 1e-12
     light = np.array([0.4, -0.5, 0.75])
     light /= np.linalg.norm(light)
-    shade = 0.45 + 0.55 * np.abs(n @ light)
-    if vals is not None:
-        _, idx = cKDTree(pts).query(tri_xyz.mean(1))
-        v = vals[idx]
-        vmax = np.percentile(vals, 99.5) or 1.0
-        cmap = plt.get_cmap("turbo")
-        cols = cmap(np.clip(v / vmax, 0, 1))[:, :3]
-    else:
-        cols = np.tile([0.62, 0.68, 0.78], (len(tris), 1))
-    cols = np.clip(cols * shade[:, None], 0, 1)
+    tree = cKDTree(pts) if vals is not None else None
+    vmax = (np.percentile(vals, 99.5) or 1.0) if vals is not None else None
+
+    def colored(t):
+        tri_xyz = verts[t]
+        n = np.cross(tri_xyz[:, 1] - tri_xyz[:, 0], tri_xyz[:, 2] - tri_xyz[:, 0])
+        n /= np.linalg.norm(n, axis=1, keepdims=True) + 1e-12
+        shade = 0.45 + 0.55 * np.abs(n @ light)
+        if vals is not None:
+            _, idx = tree.query(tri_xyz.mean(1))
+            cols = plt.get_cmap("turbo")(np.clip(vals[idx] / vmax, 0, 1))[:, :3]
+        else:
+            cols = np.tile([0.62, 0.68, 0.78], (len(t), 1))
+        return tri_xyz, np.clip(cols * shade[:, None], 0, 1)
+
+    sets = [colored(t) for t in (view_tris or [tris])]
     fig = plt.figure(figsize=(3.6 * len(views) + 0.8, 3.8), dpi=100)
     lo, hi = verts.min(0), verts.max(0)
     ctr, rad = (lo + hi) / 2, (hi - lo).max() / 2
     for k, (el, az) in enumerate(views):
         ax = fig.add_subplot(1, len(views), k + 1, projection="3d")
+        tri_xyz, cols = sets[k] if view_tris else sets[0]
         ax.add_collection3d(Poly3DCollection(tri_xyz, facecolors=cols, edgecolor="none", linewidths=0))
         for i, f in enumerate((ax.set_xlim, ax.set_ylim, ax.set_zlim)):
             f(ctr[i] - rad, ctr[i] + rad)
@@ -218,6 +328,76 @@ def render_mesh(verts, tris, path, pts=None, vals=None, title="", views=((25, -6
 def render_shape(shape, path, pts=None, vals=None, title="", views=None):
     v, t = tessellate(shape)
     return render_mesh(v, t, path, pts, vals, title, **({"views": views} if views else {}))
+
+
+def render_xray(verts, tris, cav_verts, cav_tris, path, pts, vals, title="", up=2):
+    """Hollow parts: panel 1 = whole part from outside coloured by stress, panels 2-3 = X-ray (outer skin
+    translucent, cavities solid orange) seen from the front and obliquely. The build axis `up` is drawn
+    vertical so standing figures stand."""
+    import matplotlib
+    matplotlib.use("Agg")
+    import matplotlib.pyplot as plt
+    from mpl_toolkits.mplot3d.art3d import Poly3DCollection
+    from scipy.spatial import cKDTree
+    perm = {0: (1, 2, 0), 1: (2, 0, 1), 2: (0, 1, 2)}[up]  # plot x, y, z <- model axes
+    names = ["xyz"[i] for i in perm]
+    V = np.asarray(verts)[:, perm]
+    C = np.asarray(cav_verts)[:, perm] if len(cav_tris) else np.zeros((0, 3))
+    light = np.array([0.4, -0.5, 0.75])
+    light /= np.linalg.norm(light)
+
+    def shade(t):
+        n = np.cross(t[:, 1] - t[:, 0], t[:, 2] - t[:, 0])
+        n /= np.linalg.norm(n, axis=1, keepdims=True) + 1e-12
+        return 0.45 + 0.55 * np.abs(n @ light)
+
+    outer = V[tris]
+    _, idx = cKDTree(np.asarray(pts)[:, perm]).query(outer.mean(1))
+    vmax = np.percentile(vals, 99.5) or 1.0
+    cmap = plt.get_cmap("turbo")
+    cols = np.clip(cmap(np.clip(vals[idx] / vmax, 0, 1))[:, :3] * shade(outer)[:, None], 0, 1)
+    ghost = np.column_stack([np.outer(shade(outer), [0.55, 0.62, 0.75]), np.full(len(outer), 0.22)])
+    cav = C[cav_tris] if len(cav_tris) else np.zeros((0, 3, 3))
+    cav_cols = np.column_stack([np.clip(np.outer(shade(cav), [1.0, 0.55, 0.15]), 0, 1), np.ones(len(cav))]) \
+        if len(cav) else np.zeros((0, 4))
+    xray, xcols = np.concatenate([outer, cav]), np.vstack([ghost, cav_cols])
+    # front = look along the thinner horizontal plot axis
+    ext = V.max(0) - V.min(0)
+    front = (0, -90) if ext[1] < ext[0] else (0, 0)
+    panels = [((20, -60), outer, cols, "outside, von Mises"), (front, xray, xcols, "X-ray: cavities (orange), front"),
+              ((20, -60), xray, xcols, "X-ray: cavities (orange)")]
+    fig = plt.figure(figsize=(3.6 * 3 + 0.8, 4.2), dpi=100)
+    lo, hi = V.min(0), V.max(0)
+    ctr, rad = (lo + hi) / 2, (hi - lo).max() / 2
+    for k, ((el, az), t, c, sub) in enumerate(panels):
+        ax = fig.add_subplot(1, 3, k + 1, projection="3d")
+        ax.add_collection3d(Poly3DCollection(t, facecolors=c, edgecolor="none", linewidths=0))
+        for i, f in enumerate((ax.set_xlim, ax.set_ylim, ax.set_zlim)):
+            f(ctr[i] - rad, ctr[i] + rad)
+        ax.set_box_aspect((1, 1, 1))
+        ax.view_init(el, az)
+        for f, nm in zip((ax.set_xlabel, ax.set_ylabel, ax.set_zlabel), names):
+            f(nm, fontsize=7, labelpad=-8)
+        ax.tick_params(labelsize=5, pad=-2)
+        ax.set_title(sub, fontsize=8)
+    sm = plt.cm.ScalarMappable(cmap="turbo", norm=plt.Normalize(0, vmax))
+    fig.colorbar(sm, ax=fig.axes[0], shrink=0.6, pad=0.02, fraction=0.04)
+    fig.subplots_adjust(left=0.0, right=0.98, bottom=0.02, top=0.88, wspace=0.0)
+    if title:
+        fig.suptitle(title, fontsize=9)
+    fig.savefig(path)
+    plt.close(fig)
+    return path
+
+
+def _section_plane(grid, elems, solid, ax):
+    """Coordinate along ax of the slice cutting through the most cavity (designed-out) voxels, so the
+    section shows the hollowing; without voids the slice with the most material."""
+    c = grid.elem_centers(elems)[:, ax]
+    k = np.round((c - c.min()) / grid.h).astype(int)
+    void = np.bincount(k[~solid], minlength=k.max() + 1)
+    i = int(np.argmax(void)) if void.any() else int(np.argmax(np.bincount(k[solid])))
+    return float(c.min() + (i + 0.5) * grid.h)  # keep everything up to and including that slice
 
 
 def _section_views(ax):
@@ -417,7 +597,11 @@ def _elems_with_nodes(grid, elems, node_ids):
 
 
 def _normalize_fixed(fixed):
-    return [fx if isinstance(fx, dict) and "faces" in fx else {"faces": fx} for fx in (fixed or [])]
+    out = []
+    for fx in fixed or []:
+        sel, dofs = fc_core.fixed_entry(fx)
+        out.append({"faces": sel, "dofs": dofs})
+    return out
 
 
 def _loadcases(a):
@@ -462,8 +646,9 @@ def build_voxel_problem(shape, a, resolution):
     loadcases = []
     for case in _loadcases(a):
         lc = {}
-        for ld in case:
-            ids = fc_core.select_faces(shape, ld["faces"])
+        for k, ld in enumerate(case):
+            lsel, ld = fc_core.load_entry(ld, k)
+            ids = fc_core.select_faces(shape, lsel)
             pts, w, nrm = bc.samples(ids)
             if "pressure" in ld:
                 vecs = -float(ld["pressure"]) * nrm * w[:, None] * (-1 if ld.get("reversed") else 1)
@@ -960,11 +1145,33 @@ def _half_section(verts, faces, ax, mid):
     return faces[keep]
 
 
+def _pct(v, metric):
+    return float(v.mean()) if metric == "mean" else float(np.percentile(v, {"max": 100, "p99": 99, "p95": 95}[metric]))
+
+
 def _vstats(vm, solid_vol, mat):
     return {"max": round(float(vm.max()), 2), "p99": round(float(np.percentile(vm, 99)), 2),
             "p95": round(float(np.percentile(vm, 95)), 2), "mean": round(float(vm.mean()), 2),
             "sf_p99": round(mat["yield"] / max(float(np.percentile(vm, 99)), 1e-12), 3),
             "sf_max": round(mat["yield"] / max(float(vm.max()), 1e-12), 3)}
+
+
+def _lstats(ev, mat):
+    """Interlayer stats of a voxel evaluation + governing utilisation per metric (max(vM/yield, layer))."""
+    util = ev["vm"] / mat["yield"]
+    out = {}
+    if ev.get("layer"):
+        L = ev["layer"]
+        lu = L["util"]
+        out["layer_adhesion"] = {"sigma_n_MPa": {"max": round(float(L["sigma_n"].max()), 2), "p99": round(_pct(L["sigma_n"], "p99"), 2)},
+                                 "tau_MPa": {"max": round(float(L["tau"].max()), 2), "p99": round(_pct(L["tau"], "p99"), 2)},
+                                 "sf_p99": round(1 / max(_pct(lu, "p99"), 1e-12), 3),
+                                 "sf_max": round(1 / max(float(lu.max()), 1e-12), 3)}
+        util = np.maximum(util, lu)
+    out["util"] = {m: _pct(util, m) for m in ("max", "p99", "p95", "mean")}
+    out["governing_sf"] = {"sf_p99": round(1 / max(out["util"]["p99"], 1e-12), 3),
+                           "sf_max": round(1 / max(out["util"]["max"], 1e-12), 3)}
+    return out
 
 
 def make_backend(device, n_elems):
@@ -989,20 +1196,32 @@ def act_optimize_topology(a):
     import topopt
     t0 = time.time()
     shape, meta = fc_core.load_model(a["name"])
-    mat = fc_core.get_material(a.get("material") or meta.get("material") or "steel")
+    mat = fc_core.get_material(a.get("material") or meta.get("material"))
+    layered = fc_core.is_layered(mat)
+    build = fc_core.parse_build_dir(_build_dir(a, meta))
+    mbuild = build if layered else None  # orthotropy / layer check only for printed materials
+    D = np.linalg.inv(fc_core.compliance_S(mat, mbuild and mbuild[0])) / mat["E"]  # unit in-layer E
+    layer = (mbuild[0], float(mat["yield_z"]), float(mat.get("shear_z", mat["yield_z"]))) if mbuild and "yield_z" in mat else None
     res = int(a.get("resolution", 50))
     grid, elems, passive, fixed, lcs = build_voxel_problem(shape, a, res)
     h = grid.h
     log(f"grid {grid.n} h={h:.3f}mm active={len(elems)} passive={passive.sum()} fixed_nodes={sum(len(f[0]) for f in fixed)}")
     backend, dev_note = make_backend(a.get("device"), len(elems))
-    fem = topopt.VoxelFEM(grid, elems, mat["nu"], fixed, lcs, backend=backend)
+    fem = topopt.VoxelFEM(grid, elems, D, fixed, lcs, backend=backend)
     rmin = max(float(a.get("filter_radius", 1.5 * h)) / h, 1.1)
-    sym = None
-    if a.get("symmetry"):
-        sym = topopt.mirror_map(grid, elems, [s.lower() for s in a["symmetry"]])
+    overhang = a.get("overhang")
+    overhang = (layered if overhang is None else bool(overhang)) and build is not None
+    am = topopt.AMFilter(grid, elems, passive, *build) if overhang else None
+    sym_axes = [s.lower() for s in a.get("symmetry") or []]
+    sym_note = None
+    if am is not None and build and "xyz"[build[0]] in sym_axes:  # layers break the mirror along the build axis
+        sym_axes.remove("xyz"[build[0]])
+        sym_note = f"symmetry about {'xyz'[build[0]]} dropped: the overhang filter is not symmetric along the build direction"
+    sym = topopt.mirror_map(grid, elems, sym_axes) if sym_axes else None
     metric = a.get("stress_metric", "p99")
-    full = topopt.evaluate(grid, elems, np.ones(len(elems), bool), mat["nu"], mat["E"], fixed, lcs, backend)
+    full = topopt.evaluate(grid, elems, np.ones(len(elems), bool), D, mat["E"], fixed, lcs, backend, layer)
     full_s = _vstats(full["vm"], None, mat)
+    full_l = _lstats(full, mat)
     log(f"full design: vm p99={full_s['p99']} max={full_s['max']} disp={full['disp_max']:.4g}")
     anchor = passive.copy()
     # draft: the load-path layout settles in ~20 iterations; normal/fine converge it further
@@ -1019,12 +1238,19 @@ def act_optimize_topology(a):
     def run(vf, x0=None):
         vf = total_vf(vf)
         r = topopt.simp(fem, passive, vf, penal=float(a.get("penal", 3.0)), rmin=rmin, max_iter=iters, x0=x0,
-                        sym_maps=sym, log=None, solve_tol=q_solve_tol, tol=q_tol)
+                        sym_maps=sym, log=None, solve_tol=q_solve_tol, tol=q_tol, am=am)
         solid = topopt.threshold_to_volume(r["xPhys"], passive, vf)
         solid = topopt.keep_connected(grid, elems, solid, anchor)
-        ev = topopt.evaluate(grid, elems, solid, mat["nu"], mat["E"], fixed, lcs, backend)
+        r["support_fill"] = 0
+        if am is not None:  # guarantee: every voxel (incl. the skin over voids) rests on the layer below
+            r["unsupported_before_fill"] = int(topopt.unsupported(elems, solid, am).sum())
+            solid, r["support_fill"] = topopt.self_support_fill(elems, solid, am)
+        ev = topopt.evaluate(grid, elems, solid, D, mat["E"], fixed, lcs, backend, layer)
         st = _vstats(ev["vm"], None, mat)
-        log(f"vf={vf:.3f} it={r['iterations']} t={r['time_s']}s solid={solid.mean():.3f} vm p99={st['p99']} max={st['max']} disp={ev['disp_max']:.4g}")
+        st_l = _lstats(ev, mat)
+        log(f"vf={vf:.3f} it={r['iterations']} t={r['time_s']}s solid={solid.mean():.3f} vm p99={st['p99']} max={st['max']} "
+            f"gov SF p99={st_l['governing_sf']['sf_p99']} fill={r['support_fill']} disp={ev['disp_max']:.4g}")
+        st["_l"] = st_l
         return r, solid, ev, st
 
     search = []
@@ -1032,7 +1258,7 @@ def act_optimize_topology(a):
     if sf:
         sf = float(sf)
         allow = mat["yield"] / sf
-        if full_s[metric] > allow:
+        if full_l["util"][metric] > 1 / sf:
             log("full part already exceeds the allowable stress")
         lo, hi = float(a.get("min_volume_fraction", 0.0 if shell else 0.08)), 1.0
         best = None
@@ -1040,9 +1266,10 @@ def act_optimize_topology(a):
         vf = float(a.get("volume_fraction", 0.3 if shell else 0.4))
         for step in range(int(a.get("search_steps", 6))):
             r, solid, ev, st = run(vf, x0)
-            ok = st[metric] <= allow and ev["lost_force"] < 1e-9
-            search.append({"volume_fraction": round(vf, 4), "stress_" + metric: st[metric], "ok": bool(ok),
-                           "disp_max_mm": round(ev["disp_max"], 5)})
+            ok = st["_l"]["util"][metric] <= 1 / sf and ev["lost_force"] < 1e-9
+            search.append({"volume_fraction": round(vf, 4), "stress_" + metric: st[metric],
+                           "governing_sf_" + metric: round(1 / max(st["_l"]["util"][metric], 1e-12), 3),
+                           "ok": bool(ok), "disp_max_mm": round(ev["disp_max"], 5)})
             if ok:
                 hi = vf
                 best = (vf, r, solid, ev, st)
@@ -1060,6 +1287,7 @@ def act_optimize_topology(a):
     else:
         vf = float(a.get("volume_fraction", 0.25 if shell else 0.35))
         r, solid, ev, st = run(vf)
+    st_l = st.pop("_l")
 
     # ---- geometry
     field = np.where(solid, np.maximum(r["xPhys"], 0.55), np.minimum(r["xPhys"], 0.45))
@@ -1098,7 +1326,8 @@ def act_optimize_topology(a):
     bcs = {"fixed": a.get("fixed"), "loads": a.get("loads"), "load_cases": a.get("load_cases")}
     fc_core.save_model(out_name, new_shape, {
         "source": "topology_optimization", "derived_from": a["name"], "geometry": kind,
-        "material": a.get("material") or meta.get("material"), "volume_mm3": round(vol1, 2),
+        "material": a.get("material") or meta.get("material"), "build_dir": a.get("build_dir") or meta.get("build_dir"),
+        "volume_mm3": round(vol1, 2),
         "bbox": fc_core.bbox_list(new_shape), "faces": len(new_shape.Faces), "bcs_on_original": bcs})
     stl = os.path.join(fc_core.EXPORT_DIR, out_name + ".stl")
     if hollow:
@@ -1129,16 +1358,18 @@ def act_optimize_topology(a):
         "geometry": kind,
         "grid": {"elements": list(grid.n), "voxel_mm": round(h, 3), "active": int(len(elems)), "kept_passive": int(passive.sum()),
                  "filter_radius_mm": round(rmin * h, 3)},
-        "material": {k: mat[k] for k in ("label", "E", "yield", "density")},
+        "material": fc_core.material_report(mat, mbuild),
         "original": {"volume_mm3": round(vol0, 1), "mass_g": round(vol0 * mat["density"] / 1000, 2),
                      "voxel_fem": {"von_mises_MPa": full_s, "disp_max_mm": round(full["disp_max"], 5),
-                                   "compliance": round(full["compliance"], 5)}},
+                                   "compliance": round(full["compliance"], 5),
+                                   **{k: v for k, v in full_l.items() if k != "util"}}},
         "optimized": {"volume_mm3": round(vol1, 1), "mass_g": round(vol1 * mat["density"] / 1000, 2),
                       "volume_fraction_target": round(total_vf(vf), 4),
                       "material_saved_pct": round(100 * (1 - vol1 / vol0), 1),
                       "voxel_fem": {"von_mises_MPa": st, "disp_max_mm": round(ev["disp_max"], 5),
                                     "compliance": round(ev["compliance"], 5),
-                                    "stiffness_vs_original": round(full["compliance"] / max(ev["compliance"], 1e-30), 3)},
+                                    "stiffness_vs_original": round(full["compliance"] / max(ev["compliance"], 1e-30), 3),
+                                    **{k: v for k, v in st_l.items() if k != "util"}},
                       "simp_iterations": r["iterations"]},
         "exports": {"stl": stl, "step": step, "glb": glb and glb["glb"],
                     "glb_bytes": glb and glb["packed_bytes"]},
@@ -1147,11 +1378,24 @@ def act_optimize_topology(a):
                  "stresses at load/support edges are singular - p99 is the robust metric. "
                  "Run verify (CalculiX) for final numbers."),
     }
+    if am is not None:
+        out["overhang"] = {"build_dir": ("-" if build[1] < 0 else "+") + "xyz"[build[0]], "max_overhang_deg": 45,
+                           "unsupported_voxels_before_fill": r.get("unsupported_before_fill", 0),
+                           "support_fill_voxels": r["support_fill"],
+                           "note": "AM filter in SIMP + final 45 deg fill: every voxel, including the skin above "
+                                   "internal voids, rests on the layer below (no support material). The smoothed "
+                                   "surface can deviate by ~1 voxel."}
+    elif build is not None:
+        out["overhang"] = {"filter": False, "note": "overhang=false (default for non-printed materials): "
+                                                    "voids may need support material"}
+    if sym_note:
+        out["symmetry_note"] = sym_note
     if shell:
         out["shell"] = {"thickness_mm": shell, "effective_mm": round(max(shell, h), 3),
                         "kept_fraction": round(pf, 4), "interior_fraction_kept": round(vf, 4),
                         "note": "outer surface is the original geometry; interior has closed voids - for resin "
-                                "printing add drain holes; void ceilings may need <=45 deg overhang on FDM"}
+                                "printing add drain holes" + ("" if am is not None else
+                                                             "; void ceilings may need <=45 deg overhang on FDM")}
         if hollow:
             out["shell"]["full_resolution"] = {
                 "stl": stl, "original_triangles": hollow["original_triangles"],
@@ -1167,6 +1411,7 @@ def act_optimize_topology(a):
             out["shell"]["warning"] = f"shell {shell} mm < voxel {h:.3f} mm: wall is 1 voxel; raise resolution for thinner walls"
     if search:
         out["search"] = {"target_safety_factor": sf, "allowable_MPa": round(mat["yield"] / sf, 2), "metric": metric,
+                         "criterion": "governing = min(von Mises SF, layer-adhesion SF)" if layer else "von Mises",
                          "steps": search}
     if fem.lost_force > 0:
         out["warning"] = f"{fem.lost_force:.3g} N of load did not land on voxels"
@@ -1174,24 +1419,18 @@ def act_optimize_topology(a):
     try:
         cen = grid.elem_centers(elems[solid])
         vm, view, title = ev["vm"], new_shape, f"{out_name}: -{out['optimized']['material_saved_pct']}% material, voxel von Mises [MPa]"
-        if hollow:  # half section: decimated original surface + the cavities
-            bb = shape.BoundBox
-            ax = int(np.argmin([bb.XLength, bb.YLength, bb.ZLength]))  # cut through the thinnest axis
-            mid = [bb.XMin, bb.YMin, bb.ZMin][ax] + [bb.XLength, bb.YLength, bb.ZLength][ax] / 2
+        if hollow:  # whole part + X-ray of the cavities (a planar cut misses them on figures)
             pv, pf = tessellate(shape)
             cv, cf = hollow["cav"]
-            vv = np.vstack([pv, cv])
-            ff = np.vstack([_half_section(pv, pf, ax, mid), _half_section(cv, cf, ax, mid) + len(pv)])
-            sel = cen[:, ax] <= mid
-            out["preview"] = render_mesh(vv, ff, prev, cen[sel], vm[sel], title + " - half section", views=_section_views(ax))
+            out["preview"] = render_xray(pv, pf, cv, cf, prev, cen, vm, title, up=build[0] if build else 2)
             view = None
         elif shell:  # the skin hides everything: show a half section through the thinnest axis
             bb = new_shape.BoundBox
             ax = int(np.argmin([bb.XLength, bb.YLength, bb.ZLength]))  # cut through the thinnest axis
             lo = np.array([bb.XMin, bb.YMin, bb.ZMin]) - 1
             size = np.array([bb.XLength, bb.YLength, bb.ZLength]) + 2
-            mid = lo[ax] + size[ax] / 2
-            size[ax] /= 2
+            mid = _section_plane(grid, elems, solid, ax)
+            size[ax] = mid - lo[ax]
             view = new_shape.common(Part.makeBox(*map(float, size), V(*map(float, lo))))
             sel = cen[:, ax] <= mid
             cen, vm, title = cen[sel], vm[sel], title + " - half section"
@@ -1205,10 +1444,15 @@ def act_optimize_topology(a):
     fem.close()
     if backend is not None:
         backend.close()
-    if a.get("verify", True):
+    if a.get("verify", True) and hollow:
+        # the hollowed part exists as a mesh only (new_shape is the untouched original): CalculiX would
+        # just re-solve the original twice
+        out["verify_calculix"] = {"skipped": "hollow mesh result has no solid to mesh; use the voxel_fem numbers "
+                                             "(same grid for original and optimized) or analyze the original"}
+    elif a.get("verify", True):
         try:
             a.setdefault("verify_mesh_size", round(h, 3))
-            out["verify_calculix"] = verify_ccx(shape, new_shape, a, mat, out_name)
+            out["verify_calculix"] = verify_ccx(shape, new_shape, a, mat, out_name, _build_dir(a, meta) if build else "none")
         except Exception as ex:
             out["verify_calculix"] = {"error": str(ex)[:400]}
     out["time_s"] = round(time.time() - t0, 1)
@@ -1227,21 +1471,22 @@ def _map_selectors(orig_shape, new_shape, sel_list, key="faces", tol=0.02):
     return mapped
 
 
-def verify_ccx(orig, new_shape, a, mat, label):
+def verify_ccx(orig, new_shape, a, mat, label, build_dir="z"):
     import fem_ccx
     fixed = _map_selectors(orig, new_shape, _normalize_fixed(a.get("fixed")))
     results = []
+    keys = ("von_mises_MPa", "displacement_mm", "safety_factor", "layer_adhesion", "governing_safety_factor")
     for k, case in enumerate(_loadcases(a)):
         loads = _map_selectors(orig, new_shape, case)
         r = fem_ccx.run_static(new_shape, mat, fixed, loads, mesh_size=a.get("verify_mesh_size"), order=2,
-                               label=f"{label}_verify{k}")
+                               label=f"{label}_verify{k}", build_dir=build_dir)
         r0 = None
         if a.get("verify_original", True):
             r0 = fem_ccx.run_static(orig, mat, _normalize_fixed(a.get("fixed")), case, mesh_size=a.get("verify_mesh_size"),
-                                    order=2, label=f"{label}_orig{k}")
-        entry = {"load_case": k, "optimized": {kk: _strip(r)[kk] for kk in ("von_mises_MPa", "displacement_mm", "safety_factor", "mesh", "fcstd")}}
+                                    order=2, label=f"{label}_orig{k}", build_dir=build_dir)
+        entry = {"load_case": k, "optimized": {kk: r[kk] for kk in keys + ("mesh", "fcstd") if kk in r}}
         if r0:
-            entry["original"] = {kk: _strip(r0)[kk] for kk in ("von_mises_MPa", "displacement_mm", "safety_factor")}
+            entry["original"] = {kk: r0[kk] for kk in keys if kk in r0}
         if k == 0:
             entry["preview"] = render_ccx(new_shape, r, os.path.join(fc_core.EXPORT_DIR, f"{label}_ccx_stress.png"))
         results.append(entry)
@@ -1254,7 +1499,7 @@ def act_optimize_dimensions(a):
     import optuna
     import fem_ccx
     optuna.logging.set_verbosity(optuna.logging.WARNING)
-    mat = fc_core.get_material(a.get("material") or "steel")
+    mat = fc_core.get_material(a.get("material"))
     sf = float(a.get("safety_factor", 2.0))
     allow = mat["yield"] / sf
     metric = a.get("stress_metric", "p99")
@@ -1282,14 +1527,18 @@ def act_optimize_dimensions(a):
         try:
             s = build(p)
             r = fem_ccx.run_static(s, mat, a.get("fixed"), a.get("loads"), mesh_size=a.get("mesh_size"),
-                                   order=a.get("order", 2), label=f"dimopt_{trial.number}", save_fcstd=False)
+                                   order=a.get("order", 2), label=f"dimopt_{trial.number}", save_fcstd=False,
+                                   build_dir=_build_dir(a))
             stress = r["von_mises_MPa"][metric]
+            gsf = r["governing_safety_factor"]["vs_" + metric]  # min(von Mises, layer adhesion)
             disp = r["displacement_mm"]["max"]
             mass = s.Volume * mat["density"] / 1000
-            viol = max(0.0, stress / allow - 1.0)
+            viol = max(0.0, sf / max(gsf, 1e-12) - 1.0)
             if max_disp:
                 viol += max(0.0, disp / float(max_disp) - 1.0)
-            rec.update(mass_g=round(mass, 3), stress=round(stress, 2), disp=round(disp, 5), ok=viol == 0)
+            rec.update(mass_g=round(mass, 3), stress=round(stress, 2), governing_sf=gsf, disp=round(disp, 5), ok=viol == 0)
+            if "layer_adhesion" in r:
+                rec["layer_sf"] = r["layer_adhesion"]["safety_factor"]["vs_" + metric]
             trial.set_user_attr("viol", viol)
             trials.append(rec)
             log(f"trial {trial.number} {p} mass={mass:.2f} stress={stress:.1f} ok={viol == 0}")
@@ -1307,6 +1556,7 @@ def act_optimize_dimensions(a):
     study.optimize(objective, n_trials=int(a.get("n_trials", 20)))
     ok = [t for t in trials if t.get("ok")]
     out = {"allowable_MPa": round(allow, 2), "metric": metric, "material": mat["label"], "n_trials": len(trials),
+           "criterion": "governing SF = min(von Mises, layer adhesion)" if fc_core.is_layered(mat) else "von Mises",
            "trials": sorted(trials, key=lambda t: (not t.get("ok", False), t.get("mass_g", 1e18)))[:int(a.get("show_trials", 8))]}
     if not ok:
         out["result"] = "no feasible design found - widen bounds or lower the safety factor"
@@ -1317,6 +1567,7 @@ def act_optimize_dimensions(a):
         s = build(best["params"])
         fc_core.save_model(a["out_name"], s, {"source": "dimension_optimization", "params": dict(fixed_params, **best["params"]),
                                               "ops": a.get("ops"), "script": a.get("script"), "material": a.get("material"),
+                                              "build_dir": a.get("build_dir"),
                                               "volume_mm3": round(s.Volume, 2), "bbox": fc_core.bbox_list(s), "faces": len(s.Faces)})
         out["saved_model"] = a["out_name"]
     return out
